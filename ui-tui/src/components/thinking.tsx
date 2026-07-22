@@ -328,7 +328,9 @@ function SubagentAccordion({
   const statusTone: 'dim' | 'error' | 'warn' =
     item.status === 'error' || item.status === 'failed'
       ? 'error'
-      : item.status === 'interrupted' || item.status === 'timeout'
+      : item.status === 'interrupted' ||
+          item.status === 'timeout' ||
+          (item.status === 'completed' && !!item.exitReason && item.exitReason !== 'completed')
         ? 'warn'
         : 'dim'
 
@@ -339,7 +341,14 @@ function SubagentAccordion({
 
   // Suffix packs branch rollup: status · elapsed · per-branch tool/agent/token/cost.
   // Emphasises the numbers the user can't easily eyeball from a flat list.
-  const statusLabel = item.status === 'queued' ? 'queued' : item.status === 'running' ? 'running' : String(item.status)
+  const statusLabel =
+    item.status === 'queued'
+      ? 'queued'
+      : item.status === 'running'
+        ? 'running'
+        : item.status === 'completed' && item.exitReason && item.exitReason !== 'completed'
+          ? `completed/${item.exitReason.replaceAll('_', ' ')}`
+          : String(item.status)
 
   const rollupBits: string[] = [statusLabel]
 

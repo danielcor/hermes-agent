@@ -10,6 +10,7 @@ shows a real midstream turn instead of sitting silent until persistence.
 
 from __future__ import annotations
 
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -72,6 +73,88 @@ def test_no_live_child_session_no_mirror(server, emits):
     # Only the parent-sid relay event — nothing mirrored, no state retained.
     assert [(e, s) for e, s, _ in emits] == [("subagent.tool", "parent-sid")]
     assert server._child_mirrors == {}
+
+
+def test_parent_relay_preserves_named_lane_route_identity(server, emits):
+    _relay(
+        server,
+        "subagent.start",
+        lane="review",
+        provider="xai-oauth",
+        model="grok-4.5",
+        child_session_id="child-1",
+    )
+
+    event, sid, payload = emits[0]
+    assert event == "subagent.start"
+    assert sid == "parent-sid"
+    assert payload["lane"] == "review"
+    assert payload["provider"] == "xai-oauth"
+    assert payload["model"] == "grok-4.5"
+
+
+def test_parent_relay_preserves_terminal_exit_reason(server, emits):
+    _relay(
+        server,
+        "subagent.complete",
+        child_session_id="child-1",
+        status="completed",
+        exit_reason="max_iterations",
+    )
+
+    event, sid, payload = emits[0]
+    assert event == "subagent.complete"
+    assert sid == "parent-sid"
+    assert payload["status"] == "completed"
+    assert payload["exit_reason"] == "max_iterations"
+
+
+def test_shutdown_drain_requeues_pending_event_after_competing_claim(
+    server, monkeypatch
+):
+    from tools import async_delegation
+    from tools import process_registry as process_registry_module
+    from tools.process_registry import process_registry
+
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_competing_claim",
+        "status": "completed",
+    }
+    process_registry.completion_queue.put(event)
+    monkeypatch.setattr(
+        process_registry_module,
+        "format_process_notification",
+        lambda _event: "delegation complete",
+    )
+    monkeypatch.setattr(
+        async_delegation, "claim_event_delivery", lambda _event, _consumer: None
+    )
+    monkeypatch.setattr(
+        async_delegation, "event_delivery_is_pending", lambda _event: True
+    )
+    monkeypatch.setattr(
+        server, "_notification_event_belongs_elsewhere", lambda *_args: False
+    )
+    monkeypatch.setattr(
+        server, "_notification_event_requires_owner", lambda _event: False
+    )
+
+    stop_event = threading.Event()
+    stop_event.set()
+    session = {
+        "_finalized": False,
+        "history_lock": threading.RLock(),
+        "running": False,
+    }
+
+    server._notification_poller_loop(stop_event, "sid-1", session)
+
+    assert session["running"] is False
+    assert process_registry.completion_queue.get_nowait() == event
 
 
 def test_live_child_session_gets_native_stream(server, emits):

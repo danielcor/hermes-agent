@@ -1484,6 +1484,44 @@ def test_named_custom_provider_api_mode(monkeypatch):
     assert resolved["base_url"] == "http://localhost:8000/v1"
 
 
+def test_runtime_provider_uses_supplied_config_snapshot(monkeypatch):
+    snapshot = {
+        "providers": {
+            "snapshot-lane": {
+                "enabled": True,
+                "base_url": "https://snapshot.invalid/v1",
+                "api_key": "snapshot-key",
+                "extra_headers": {"Authorization": "Bearer snapshot"},
+            }
+        }
+    }
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: (_ for _ in ()).throw(AssertionError("ambient config reloaded")),
+    )
+    monkeypatch.setattr(
+        rp,
+        "_try_resolve_from_custom_pool",
+        lambda *args, **kwargs: {
+            "provider": "custom",
+            "base_url": "https://ambient-pool.invalid/v1",
+            "api_key": "ambient-pool-key",
+            "api_mode": "chat_completions",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(
+        requested="custom:snapshot-lane",
+        target_model="snapshot-model",
+        _config_snapshot=snapshot,
+    )
+
+    assert resolved["api_key"] == "snapshot-key"
+    assert resolved["base_url"] == "https://snapshot.invalid/v1"
+    assert resolved["extra_headers"]["Authorization"] == "Bearer snapshot"
+
+
 def test_named_custom_provider_without_api_mode_defaults(monkeypatch):
     """custom_providers entries without api_mode should default to chat_completions."""
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "my-server")
@@ -3166,6 +3204,44 @@ def test_resolve_runtime_provider_bedrock_nonclaude_target_model_uses_converse(m
     assert resolved["provider"] == "bedrock"
     assert resolved["api_mode"] == "bedrock_converse"
     assert resolved.get("bedrock_anthropic") is not True
+
+
+def test_snapshot_bedrock_route_captures_credentials_and_guardrail(monkeypatch):
+    _patch_bedrock(monkeypatch, config_default="amazon.nova-pro-v1:0")
+    import agent.bedrock_adapter as ba
+
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda snapshot=None: dict((snapshot or {}).get("model", {})),
+    )
+    credential_snapshot = object()
+    monkeypatch.setattr(
+        ba, "capture_bedrock_credentials", lambda: credential_snapshot
+    )
+    config_snapshot = {
+        "model": {"default": "amazon.nova-pro-v1:0"},
+        "bedrock": {
+            "guardrail": {
+                "guardrail_identifier": "guard-A",
+                "guardrail_version": "1",
+                "trace": "enabled",
+            }
+        },
+    }
+
+    resolved = rp.resolve_runtime_provider(
+        requested="bedrock",
+        target_model="amazon.nova-pro-v1:0",
+        _config_snapshot=config_snapshot,
+    )
+
+    assert resolved["bedrock_credentials"] is credential_snapshot
+    assert resolved["bedrock_guardrail_config"] == {
+        "guardrailIdentifier": "guard-A",
+        "guardrailVersion": "1",
+        "trace": "enabled",
+    }
 
 
 def test_auto_provider_with_local_base_url_bypasses_anthropic_key(monkeypatch):

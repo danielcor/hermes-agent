@@ -394,7 +394,7 @@ Edit with `hermes config edit` or `hermes config set section.key value`.
 | `tts` | `provider` (edge/elevenlabs/openai/minimax/mistral/neutts) |
 | `memory` | `memory_enabled`, `user_profile_enabled`, `provider` |
 | `security` | `tirith_enabled`, `website_blocklist` |
-| `delegation` | `model`, `provider`, `base_url`, `api_key`, `max_iterations` (50), `reasoning_effort` |
+| `delegation` | `model`, `provider`, `base_url`, `api_key`, `max_iterations` (50), `reasoning_effort`, `lanes.<name>.{enabled,provider,model,reasoning_effort}` |
 | `checkpoints` | `enabled`, `max_snapshots` (50) |
 | `curator` | `enabled`, `consolidate` (false — opt-in aux-model skill consolidation), `interval_hours`, `stale_after_days` |
 
@@ -714,6 +714,10 @@ Spawn a subagent with an isolated context + terminal session.
   re-enters the conversation as a new turn when it finishes.
 - **Roles:** `leaf` (default; cannot re-delegate) vs `orchestrator`
   (can spawn its own workers, bounded by `delegation.max_spawn_depth`).
+- **Named lanes:** `delegate_task(..., lane="review")` selects a trusted
+  `delegation.lanes.review` provider/model/reasoning route. Lane definitions
+  never contain credentials or endpoints, and omission preserves the global
+  delegation route.
 - **Not durable.** A backgrounded child is still process-local — if the
   parent process exits, the child is lost. For work that must outlive
   the process, use `cronjob` or

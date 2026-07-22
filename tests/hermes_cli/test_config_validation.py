@@ -10,6 +10,74 @@ from hermes_cli.config import (
 )
 
 
+class TestDelegationLaneValidation:
+    def test_valid_named_lanes(self):
+        issues = validate_config_structure({
+            "delegation": {
+                "lanes": {
+                    "review": {
+                        "provider": "openrouter",
+                        "model": "anthropic/claude-sonnet-4",
+                        "reasoning_effort": "high",
+                    },
+                    "disabled": {"enabled": False},
+                }
+            }
+        })
+        assert issues == []
+
+    def test_rejects_invalid_lane_shapes_and_fields(self):
+        sentinel = "SENSITIVE_ROUTE_POLICY_VALUE"
+        issues = validate_config_structure({
+            "delegation": {
+                "lanes": {
+                    "bad-shape": "model-name",
+                    "bad-fields": {"api_key": "secret", "enabled": "yes"},
+                    "bad-effort": {"reasoning_effort": sentinel},
+                }
+            }
+        })
+        messages = [issue.message for issue in issues]
+        assert any("bad-shape should be a dict" in message for message in messages)
+        assert any("unknown field(s)" in message for message in messages)
+        assert any("enabled must be a boolean" in message for message in messages)
+        assert any("reasoning_effort is invalid" in message for message in messages)
+        assert all(sentinel not in message for message in messages)
+
+    def test_rejects_non_mapping_lane_container(self):
+        issues = validate_config_structure({"delegation": {"lanes": []}})
+        assert any("delegation.lanes should be a dict" in issue.message for issue in issues)
+
+    def test_rejects_non_mapping_delegation_container(self):
+        issues = validate_config_structure({"delegation": []})
+        assert any("delegation should be a dict" in issue.message for issue in issues)
+
+    def test_rejects_empty_padded_and_non_string_lane_names(self):
+        issues = validate_config_structure({
+            "delegation": {
+                "lanes": {
+                    "": {"model": "review-model"},
+                    " padded ": {"model": "review-model"},
+                    7: {"model": "review-model"},
+                }
+            }
+        })
+        messages = [issue.message for issue in issues]
+        assert any("lane name must be a non-empty string" in message for message in messages)
+        assert any("lane name must not have surrounding whitespace" in message for message in messages)
+
+    def test_mixed_type_unknown_fields_return_controlled_issue(self):
+        issues = validate_config_structure({
+            "delegation": {
+                "lanes": {"review": {7: "value", "bogus": "value"}}
+            }
+        })
+
+        messages = [issue.message for issue in issues]
+        assert any("2 unknown field(s)" in message for message in messages)
+        assert all("bogus" not in message for message in messages)
+
+
 class TestCustomProvidersValidation:
     """custom_providers must be a YAML list, not a dict."""
 

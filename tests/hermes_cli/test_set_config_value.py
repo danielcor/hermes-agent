@@ -108,6 +108,49 @@ class TestConfigYamlRouting:
         assert "docker" in config
         assert "terminal" not in _read_env(_isolated_hermes_home)
 
+    def test_named_lane_fields_use_dynamic_template(self, _isolated_hermes_home):
+        set_config_value("delegation.lanes.review.enabled", "false")
+        set_config_value("delegation.lanes.review.provider", "openrouter")
+        set_config_value("delegation.lanes.review.model", "anthropic/claude-sonnet-4")
+        set_config_value("delegation.lanes.review.reasoning_effort", "high")
+
+        from hermes_cli.config import load_config
+
+        lane = load_config()["delegation"]["lanes"]["review"]
+        assert lane == {
+            "enabled": False,
+            "provider": "openrouter",
+            "model": "anthropic/claude-sonnet-4",
+            "reasoning_effort": "high",
+        }
+
+    def test_named_lane_invalid_value_is_rejected_before_write(
+        self, _isolated_hermes_home
+    ):
+        with pytest.raises(ValueError, match="reasoning_effort is invalid"):
+            set_config_value(
+                "delegation.lanes.review.reasoning_effort", "super-high"
+            )
+
+        config = _read_config(_isolated_hermes_home)
+        assert "super-high" not in config
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "delegation.lanes",
+            "delegation.lanes..model",
+            "delegation.lanes. review.model",
+            "delegation.lanes.review",
+            "delegation.lanes.review.endpoint",
+        ],
+    )
+    def test_named_lane_dynamic_key_rejects_malformed_path(
+        self, _isolated_hermes_home, key
+    ):
+        with pytest.raises(ValueError):
+            set_config_value(key, "review-model")
+
     def test_terminal_image_goes_to_config(self, _isolated_hermes_home):
         """TERMINAL_DOCKER_IMAGE doesn't match _API_KEY or _TOKEN, so config.yaml."""
         set_config_value("terminal.docker_image", "python:3.12")

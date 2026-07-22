@@ -278,8 +278,8 @@ def _auto_detect_local_model(base_url: str) -> str:
     return ""
 
 
-def _get_model_config() -> Dict[str, Any]:
-    config = load_config()
+def _get_model_config(config_snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    config = config_snapshot if isinstance(config_snapshot, dict) else load_config()
     model_cfg = config.get("model")
     if isinstance(model_cfg, dict):
         cfg = dict(model_cfg)
@@ -298,6 +298,15 @@ def _get_model_config() -> Dict[str, Any]:
     if isinstance(model_cfg, str) and model_cfg.strip():
         return {"default": model_cfg.strip()}
     return {}
+
+
+def _get_model_config_from_snapshot(
+    config_snapshot: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Preserve the legacy zero-argument helper call when no snapshot exists."""
+    if config_snapshot is None:
+        return _get_model_config()
+    return _get_model_config(config_snapshot)
 
 
 def _provider_supports_explicit_api_mode(provider: Optional[str], configured_provider: Optional[str] = None) -> bool:
@@ -615,7 +624,10 @@ def _lift_extra_headers(entry: Dict[str, Any], result: Dict[str, Any]) -> None:
         result["extra_headers"] = extra_headers
 
 
-def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, Any]]:
+def _get_named_custom_provider(
+    requested_provider: str,
+    config_snapshot: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
     requested_norm = _normalize_custom_provider_name(requested_provider or "")
     if not requested_norm:
         return None
@@ -654,8 +666,8 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
             if (canonical or "").strip().lower() == requested_norm:
                 return None
 
-    config = load_config()
-    
+    config = config_snapshot if isinstance(config_snapshot, dict) else load_config()
+
     # First check providers: dict (new-style user-defined providers)
     providers = config.get("providers")
     if isinstance(providers, dict):
@@ -926,6 +938,7 @@ def _resolve_named_custom_runtime(
     requested_provider: str,
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
+    config_snapshot: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     # Bare `provider="custom"` with an explicit base_url (e.g. propagated
     # from a `model_aliases:` direct-alias resolution) — build a runtime
@@ -978,7 +991,12 @@ def _resolve_named_custom_runtime(
             "requested_provider": requested_provider,
         }
 
-    custom_provider = _get_named_custom_provider(requested_provider)
+    if config_snapshot is None:
+        custom_provider = _get_named_custom_provider(requested_provider)
+    else:
+        custom_provider = _get_named_custom_provider(
+            requested_provider, config_snapshot=config_snapshot
+        )
     if not custom_provider:
         return None
 
@@ -989,8 +1007,18 @@ def _resolve_named_custom_runtime(
     if not base_url:
         return None
 
-    # Check if a credential pool exists for this custom endpoint
-    pool_result = _try_resolve_from_custom_pool(base_url, "custom", custom_provider.get("api_mode"), provider_name=custom_provider.get("name"))
+    # A supplied config snapshot is an immutable-route contract. The process
+    # credential pool is ambient mutable state and may have been rebuilt from a
+    # newer config generation, so only ordinary runtime resolution may consult
+    # it. Snapshot callers use the entry/key_env captured above.
+    pool_result = None
+    if config_snapshot is None:
+        pool_result = _try_resolve_from_custom_pool(
+            base_url,
+            "custom",
+            custom_provider.get("api_mode"),
+            provider_name=custom_provider.get("name"),
+        )
     if pool_result:
         # Propagate the model name even when using pooled credentials —
         # the pool doesn't know about the custom_providers model field.
@@ -1058,8 +1086,9 @@ def _resolve_openrouter_runtime(
     requested_provider: str,
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
+    config_snapshot: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    model_cfg = _get_model_config()
+    model_cfg = _get_model_config_from_snapshot(config_snapshot)
     cfg_base_url = model_cfg.get("base_url") if isinstance(model_cfg.get("base_url"), str) else ""
     cfg_provider = model_cfg.get("provider") if isinstance(model_cfg.get("provider"), str) else ""
     cfg_api_key = ""
@@ -1525,6 +1554,7 @@ def resolve_runtime_provider(
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
     target_model: Optional[str] = None,
+    _config_snapshot: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Resolve runtime provider credentials for agent execution.
 
@@ -1549,7 +1579,9 @@ def resolve_runtime_provider(
     # Fail fast with a typed error so the fallback chain can advance to
     # the next provider instead of using a disabled one.
     from hermes_cli.config import is_provider_enabled, load_config
-    _full_cfg = load_config()
+    _full_cfg = (
+        _config_snapshot if isinstance(_config_snapshot, dict) else load_config()
+    )
     _provs_cfg = _full_cfg.get("providers") if isinstance(_full_cfg, dict) else None
     if isinstance(_provs_cfg, dict):
         _block = _provs_cfg.get(requested_provider)
@@ -1597,7 +1629,7 @@ def resolve_runtime_provider(
     if requested_provider == "azure-foundry":
         azure_runtime = _resolve_azure_foundry_runtime(
             requested_provider=requested_provider,
-            model_cfg=_get_model_config(),
+            model_cfg=_get_model_config_from_snapshot(_config_snapshot),
             explicit_api_key=explicit_api_key,
             explicit_base_url=explicit_base_url,
             target_model=target_model,
@@ -1615,9 +1647,17 @@ def resolve_runtime_provider(
     # margin) by get_vertex_config(); mid-session expiry is additionally
     # recovered on 401 by run_agent._try_refresh_vertex_client_credentials().
     if requested_provider in ("vertex", "google-vertex", "vertex-ai", "gcp-vertex", "vertexai"):
-        from agent.vertex_adapter import get_vertex_config
+        from agent.vertex_adapter import DEFAULT_REGION, get_vertex_config
 
-        token, base_url = get_vertex_config()
+        if isinstance(_config_snapshot, dict):
+            vertex_cfg = _config_snapshot.get("vertex")
+            vertex_cfg = vertex_cfg if isinstance(vertex_cfg, dict) else {}
+            token, base_url = get_vertex_config(
+                region=str(vertex_cfg.get("region") or DEFAULT_REGION),
+                project_id=str(vertex_cfg.get("project_id") or ""),
+            )
+        else:
+            token, base_url = get_vertex_config()
         if not token or not base_url:
             raise AuthError(
                 "Vertex AI credentials could not be resolved. Vertex uses "
@@ -1637,11 +1677,14 @@ def resolve_runtime_provider(
             "requested_provider": requested_provider,
         }
 
-    custom_runtime = _resolve_named_custom_runtime(
-        requested_provider=requested_provider,
-        explicit_api_key=explicit_api_key,
-        explicit_base_url=explicit_base_url,
-    )
+    custom_runtime_kwargs: Dict[str, Any] = {
+        "requested_provider": requested_provider,
+        "explicit_api_key": explicit_api_key,
+        "explicit_base_url": explicit_base_url,
+    }
+    if _config_snapshot is not None:
+        custom_runtime_kwargs["config_snapshot"] = _config_snapshot
+    custom_runtime = _resolve_named_custom_runtime(**custom_runtime_kwargs)
     if custom_runtime:
         custom_runtime["requested_provider"] = requested_provider
         return custom_runtime
@@ -1652,7 +1695,7 @@ def resolve_runtime_provider(
     # resolve_provider() pick up an ANTHROPIC_API_KEY or OPENAI_API_KEY from
     # the environment and send the request to a cloud API. Fixes #3846.
     if not explicit_base_url and not explicit_api_key:
-        model_cfg = _get_model_config()
+        model_cfg = _get_model_config_from_snapshot(_config_snapshot)
         cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
         cfg_base_url = str(model_cfg.get("base_url") or "").strip()
         if cfg_base_url and cfg_provider in ("auto", ""):
@@ -1675,11 +1718,14 @@ def resolve_runtime_provider(
                 base_url_host_matches(cfg_base_url, host)
                 for host in _known_cloud_hosts
             ):
-                runtime = _resolve_openrouter_runtime(
-                    requested_provider=requested_provider,
-                    explicit_api_key=explicit_api_key,
-                    explicit_base_url=explicit_base_url,
-                )
+                openrouter_kwargs: Dict[str, Any] = {
+                    "requested_provider": requested_provider,
+                    "explicit_api_key": explicit_api_key,
+                    "explicit_base_url": explicit_base_url,
+                }
+                if _config_snapshot is not None:
+                    openrouter_kwargs["config_snapshot"] = _config_snapshot
+                runtime = _resolve_openrouter_runtime(**openrouter_kwargs)
                 runtime["requested_provider"] = requested_provider
                 return runtime
 
@@ -1688,7 +1734,7 @@ def resolve_runtime_provider(
         explicit_api_key=explicit_api_key,
         explicit_base_url=explicit_base_url,
     )
-    model_cfg = _get_model_config()
+    model_cfg = _get_model_config_from_snapshot(_config_snapshot)
     explicit_runtime = _resolve_explicit_runtime(
         provider=provider,
         requested_provider=requested_provider,
@@ -1964,6 +2010,7 @@ def resolve_runtime_provider(
     # AWS Bedrock (native Converse API via boto3)
     if provider == "bedrock":
         from agent.bedrock_adapter import (
+            capture_bedrock_credentials,
             has_aws_credentials,
             resolve_aws_auth_env_var,
             resolve_bedrock_region,
@@ -1984,10 +2031,15 @@ def resolve_runtime_provider(
                 code="no_aws_credentials",
             )
         # Read bedrock-specific config from config.yaml
-        _bedrock_cfg = load_config().get("bedrock", {})
+        _bedrock_source = _config_snapshot if isinstance(_config_snapshot, dict) else load_config()
+        _bedrock_cfg = _bedrock_source.get("bedrock", {})
+        _bedrock_cfg = _bedrock_cfg if isinstance(_bedrock_cfg, dict) else {}
         # Region priority: config.yaml bedrock.region → env var → us-east-1
         region = (_bedrock_cfg.get("region") or "").strip() or resolve_bedrock_region()
         auth_source = resolve_aws_auth_env_var() or "aws-sdk-default-chain"
+        credential_snapshot = (
+            capture_bedrock_credentials() if _config_snapshot is not None else None
+        )
         # Build guardrail config if configured
         _gr = _bedrock_cfg.get("guardrail", {})
         guardrail_config = None
@@ -2021,6 +2073,8 @@ def resolve_runtime_provider(
                 "source": auth_source,
                 "region": region,
                 "bedrock_anthropic": True,  # Signal to use AnthropicBedrock client
+                "bedrock_credentials": credential_snapshot,
+                "bedrock_guardrail_config": guardrail_config or {},
                 "requested_provider": requested_provider,
             }
         else:
@@ -2032,6 +2086,8 @@ def resolve_runtime_provider(
                 "api_key": "aws-sdk",
                 "source": auth_source,
                 "region": region,
+                "bedrock_credentials": credential_snapshot,
+                "bedrock_guardrail_config": guardrail_config or {},
                 "requested_provider": requested_provider,
             }
         if guardrail_config:
@@ -2110,11 +2166,14 @@ def resolve_runtime_provider(
             "requested_provider": requested_provider,
         }
 
-    runtime = _resolve_openrouter_runtime(
-        requested_provider=requested_provider,
-        explicit_api_key=explicit_api_key,
-        explicit_base_url=explicit_base_url,
-    )
+    openrouter_kwargs = {
+        "requested_provider": requested_provider,
+        "explicit_api_key": explicit_api_key,
+        "explicit_base_url": explicit_base_url,
+    }
+    if _config_snapshot is not None:
+        openrouter_kwargs["config_snapshot"] = _config_snapshot
+    runtime = _resolve_openrouter_runtime(**openrouter_kwargs)
     runtime["requested_provider"] = requested_provider
     return runtime
 

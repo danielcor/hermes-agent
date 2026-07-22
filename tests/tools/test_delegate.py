@@ -9,12 +9,16 @@ Run with:  python -m pytest tests/test_delegate.py -v
    or:     python tests/test_delegate.py
 """
 
+import inspect
 import json
 import os
+import tempfile
 import threading
 import time
 import types
 import unittest
+from pathlib import Path
+from types import MappingProxyType
 from unittest.mock import MagicMock, patch
 
 from tools.delegate_tool import (
@@ -71,6 +75,8 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("goal", props)
         self.assertIn("tasks", props)
         self.assertIn("context", props)
+        self.assertIn("lane", props)
+        self.assertEqual(props["lane"]["type"], "string")
         # toolsets is intentionally NOT exposed to the model — subagents always
         # inherit the parent's toolsets. Letting the model name toolsets was a
         # capability-selection surface the model should not control.
@@ -87,6 +93,21 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("acp_command", props["tasks"]["items"]["properties"])
         self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
+
+    def test_positional_signature_preserves_existing_callers(self):
+        params = list(inspect.signature(delegate_task).parameters)
+        self.assertEqual(
+            params[:7],
+            [
+                "goal",
+                "context",
+                "tasks",
+                "max_iterations",
+                "role",
+                "background",
+                "parent_agent",
+            ],
+        )
 
     def test_schema_description_advertises_runtime_limits(self):
         """The model must see the user's actual concurrency / spawn-depth caps,
@@ -350,6 +371,121 @@ class TestDelegateTask(unittest.TestCase):
         self.assertEqual(result["results"][1]["summary"], "Result B")
         self.assertIn("total_duration_seconds", result)
 
+    def test_partial_batch_submission_failure_terminalizes_unsubmitted_children(self):
+        from concurrent.futures import Future
+
+        parent = _make_mock_parent()
+        parent._active_children = []
+        built_children = []
+        progress_callbacks = []
+
+        def build_child(**kwargs):
+            child = MagicMock()
+            child.session_id = f"child-{kwargs['task_index']}"
+            child._delegate_role = "leaf"
+            child._delegate_progress_callback = MagicMock()
+            child.tool_progress_callback = child._delegate_progress_callback
+            built_children.append(child)
+            progress_callbacks.append(child._delegate_progress_callback)
+            parent._active_children.append(child)
+            return child
+
+        def run_child(*, task_index, child, **_kwargs):
+            parent._active_children.remove(child)
+            child.close()
+            return {
+                "task_index": task_index,
+                "status": "completed",
+                "summary": "done",
+                "api_calls": 1,
+                "duration_seconds": 0,
+                "_child_role": "leaf",
+            }
+
+        class PartialSubmitExecutor:
+            def __init__(self, **_kwargs):
+                self.submit_count = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def submit(self, fn, **kwargs):
+                self.submit_count += 1
+                if self.submit_count == 2:
+                    raise RuntimeError("executor rejected second child")
+                future = Future()
+                future.set_result(fn(**kwargs))
+                return future
+
+        with patch("tools.delegate_tool._build_child_agent", side_effect=build_child), patch(
+            "tools.delegate_tool._run_single_child", side_effect=run_child
+        ), patch(
+            "tools.daemon_pool.DaemonThreadPoolExecutor", PartialSubmitExecutor
+        ):
+            result = json.loads(
+                delegate_task(
+                    tasks=[{"goal": "one"}, {"goal": "two"}, {"goal": "three"}],
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertEqual(
+            [entry["status"] for entry in result["results"]],
+            ["completed", "failed", "failed"],
+        )
+        self.assertEqual(parent._active_children, [])
+        for child in built_children:
+            child.close.assert_called_once()
+        for progress_callback in progress_callbacks[1:]:
+            progress_callback.assert_called_once()
+            callback_args, callback_kwargs = progress_callback.call_args
+            self.assertEqual(callback_args[0], "subagent.complete")
+            self.assertEqual(callback_kwargs["status"], "failed")
+            self.assertEqual(callback_kwargs["duration_seconds"], 0)
+            self.assertTrue(callback_kwargs["summary"])
+
+    def test_parent_interrupted_pending_batch_entries_have_exit_reason(self):
+        from concurrent.futures import Future
+
+        parent = _make_mock_parent()
+        parent._interrupt_requested = True
+        pending_futures = []
+
+        class PendingExecutor:
+            def __init__(self, **_kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                for future in pending_futures:
+                    future.cancel()
+                return False
+
+            def submit(self, *_args, **_kwargs):
+                future = Future()
+                pending_futures.append(future)
+                return future
+
+        with patch(
+            "tools.daemon_pool.DaemonThreadPoolExecutor", PendingExecutor
+        ):
+            result = json.loads(
+                delegate_task(
+                    tasks=[{"goal": "one"}, {"goal": "two"}],
+                    parent_agent=parent,
+                )
+            )
+
+        assert {entry["status"] for entry in result["results"]} == {"interrupted"}
+        assert {
+            entry["exit_reason"] for entry in result["results"]
+        } == {"interrupted"}
+
     @patch("tools.delegate_tool._run_single_child")
     def test_batch_mode_accepts_json_string_tasks(self, mock_run):
         mock_run.side_effect = [
@@ -393,6 +529,19 @@ class TestDelegateTask(unittest.TestCase):
 
         self.assertIn("error", result)
         self.assertIn("Task 0 must be an object", result["error"])
+        mock_run.assert_not_called()
+
+    @patch("tools.delegate_tool._run_single_child")
+    def test_batch_mode_rejects_non_string_goals(self, mock_run):
+        parent = _make_mock_parent()
+
+        for malformed in (None, 7, [], {}):
+            with self.subTest(goal=malformed):
+                result = json.loads(
+                    delegate_task(tasks=[{"goal": malformed}], parent_agent=parent)
+                )
+                self.assertIn("error", result)
+                self.assertIn("goal must be a non-empty string", result["error"])
         mock_run.assert_not_called()
 
     @patch("tools.delegate_tool._run_single_child")
@@ -545,6 +694,7 @@ class TestDelegateTask(unittest.TestCase):
             )
 
         self.assertTrue(callable(mock_child.thinking_callback))
+        parent.tool_progress_callback.reset_mock()
         mock_child.thinking_callback("deliberating...")
         parent.tool_progress_callback.assert_not_called()
 
@@ -581,13 +731,19 @@ class TestToolNamePreservation(unittest.TestCase):
         original_tools = ["terminal", "read_file", "web_search"]
         model_tools._last_resolved_tool_names = list(original_tools)
 
-        with patch("run_agent.AIAgent") as MockAgent:
+        sentinel = "https://secret.invalid/v1 api-key acp-command --secret-arg"
+        with patch("run_agent.AIAgent") as MockAgent, self.assertLogs(
+            "tools.delegate_tool", level="WARNING"
+        ) as captured:
             mock_child = MagicMock()
-            mock_child.run_conversation.side_effect = RuntimeError("boom")
+            mock_child.run_conversation.side_effect = RuntimeError(sentinel)
             MockAgent.return_value = mock_child
 
             result = json.loads(delegate_task(goal="Crash test", parent_agent=parent))
-            self.assertEqual(result["results"][0]["status"], "error")
+            self.assertEqual(result["results"][0]["status"], "failed")
+            self.assertEqual(result["results"][0]["exit_reason"], "error")
+            self.assertNotIn(sentinel, json.dumps(result))
+            self.assertNotIn(sentinel, "\n".join(captured.output))
 
         self.assertEqual(model_tools._last_resolved_tool_names, original_tools)
 
@@ -628,9 +784,11 @@ class TestToolNamePreservation(unittest.TestCase):
         parent.acp_command = None
         parent.acp_args = []
         captured = {}
+        sensitive_command = "sensitive-acp-command"
 
         with patch("run_agent.AIAgent") as MockAgent, \
-             patch("shutil.which", return_value=None) as mock_which:
+             patch("shutil.which", return_value=None) as mock_which, \
+             self.assertLogs("tools.delegate_tool", level="WARNING") as captured_logs:
             mock_child = MagicMock()
             MockAgent.return_value = mock_child
 
@@ -643,7 +801,7 @@ class TestToolNamePreservation(unittest.TestCase):
                 max_iterations=10,
                 parent_agent=parent,
                 task_count=1,
-                override_acp_command="copilot",
+                override_acp_command=sensitive_command,
                 override_acp_args=["--foo"],
             )
 
@@ -655,8 +813,9 @@ class TestToolNamePreservation(unittest.TestCase):
         # any_call, not called_with: the patch is global to shutil.which, so an
         # unrelated which("uv") from a code path reached later in the same
         # process (order-dependent under CI test-slicing) can be the *last*
-        # call. The intent here is only that the copilot binary was probed.
-        mock_which.assert_any_call("copilot")
+        # call. The intent here is only that the configured binary was probed.
+        mock_which.assert_any_call(sensitive_command)
+        self.assertNotIn(sensitive_command, "\n".join(captured_logs.output))
         self.assertNotEqual(
             captured["provider"],
             "copilot-acp",
@@ -783,6 +942,36 @@ class TestDelegateObservability(unittest.TestCase):
             self.assertIn("args_bytes", entry["tool_trace"][0])
             self.assertIn("result_bytes", entry["tool_trace"][0])
             self.assertEqual(entry["tool_trace"][0]["status"], "ok")
+
+    def test_omitted_lane_reports_model_selected_during_fallback(self):
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "primary-model"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+
+            def run_with_fallback(*_args, **_kwargs):
+                mock_child.model = "fallback-model"
+                mock_child.provider = "fallback-provider"
+                return {
+                    "final_response": "done",
+                    "completed": True,
+                    "interrupted": False,
+                    "api_calls": 2,
+                    "messages": [],
+                }
+
+            mock_child.run_conversation.side_effect = run_with_fallback
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Fallback", parent_agent=parent))
+
+        self.assertEqual(result["results"][0]["model"], "fallback-model")
+        self.assertEqual(result["results"][0]["provider"], "fallback-provider")
+        self.assertEqual(result["model"], "fallback-model")
+        self.assertEqual(result["provider"], "fallback-provider")
 
     def test_tool_trace_handles_list_content_blocks(self):
         """Tool-result content blocks should not crash observability metadata."""
@@ -1167,8 +1356,1464 @@ class TestBlockedTools(unittest.TestCase):
         self.assertEqual(_MIN_SPAWN_DEPTH, 1)
 
 
+class TestDelegationLaneResolution(unittest.TestCase):
+    """Trusted named lanes resolve one immutable route before child creation."""
+
+    def test_lane_overrides_route_and_reasoning_but_inherits_global_defaults(self):
+        from tools.delegate_tool import _resolve_delegation_route
+
+        cfg = {
+            "model": "global-model",
+            "base_url": "https://delegation.example/v1",
+            "api_key": "test-key",
+            "reasoning_effort": "low",
+            "lanes": {
+                "review": {
+                    "model": "review-model",
+                    "reasoning_effort": "high",
+                }
+            },
+        }
+
+        route = _resolve_delegation_route(cfg, _make_mock_parent(), lane="review")
+
+        self.assertEqual(route.lane, "review")
+        self.assertEqual(route.model, "review-model")
+        self.assertEqual(route.provider, "custom")
+        self.assertEqual(route.base_url, "https://delegation.example/v1")
+        self.assertEqual(route.api_key, "test-key")
+        self.assertEqual(route.reasoning_config, {"enabled": True, "effort": "high"})
+
+    def test_named_acp_route_preserves_effective_empty_args(self):
+        from tools.delegate_tool import _resolve_delegation_route
+
+        parent = _make_mock_parent()
+        parent.provider = "copilot-acp"
+        parent.acp_command = "trusted-acp"
+        parent.acp_args = []
+        parent.client = MagicMock()
+        parent.client._acp_command = "trusted-acp"
+        parent.client._acp_args = []
+
+        with patch(
+            "agent.copilot_acp_client._resolve_args",
+            side_effect=AssertionError("ambient args must not be read"),
+        ):
+            route = _resolve_delegation_route(
+                {"lanes": {"review": {"model": "review-model"}}},
+                parent,
+                lane="review",
+            )
+
+        self.assertEqual(route.args, ())
+
+    def test_named_acp_route_rejects_unavailable_frozen_command(self):
+        from tools.delegate_tool import _build_child_agent
+
+        parent = _make_mock_parent()
+        with patch("shutil.which", return_value=None), patch(
+            "run_agent.AIAgent"
+        ) as agent_cls:
+            with self.assertRaisesRegex(ValueError, "ACP command.*unavailable"):
+                _build_child_agent(
+                    task_index=0,
+                    goal="review",
+                    context=None,
+                    toolsets=None,
+                    model=None,
+                    parent_agent=parent,
+                    max_iterations=5,
+                    task_count=1,
+                    role="leaf",
+                    override_provider="copilot-acp",
+                    override_acp_command="trusted-acp",
+                    override_acp_args=[],
+                    lane="review",
+                )
+
+        agent_cls.assert_not_called()
+
+    def test_direct_endpoint_lane_snapshots_deferred_parent_values(self):
+        from tools.delegate_tool import _resolve_delegation_route
+
+        parent = _make_mock_parent()
+        parent.api_key = "***"
+        parent.max_tokens = 8192
+        cfg = {
+            "base_url": "https://delegation.example/v1",
+            "lanes": {"review": {"model": "review-model"}},
+        }
+
+        route = _resolve_delegation_route(cfg, parent, lane="review")
+
+        self.assertEqual(route.api_key, "***")
+        self.assertEqual(route.max_output_tokens, 8192)
+
+    def test_reasoning_only_lane_snapshots_parent_model_and_transport(self):
+        from tools.delegate_tool import _resolve_delegation_route
+
+        parent = _make_mock_parent()
+        route = _resolve_delegation_route(
+            {"lanes": {"review": {"reasoning_effort": "high"}}},
+            parent,
+            lane="review",
+        )
+
+        self.assertEqual(route.model, parent.model)
+        self.assertEqual(route.provider, parent.provider)
+        self.assertEqual(route.base_url, parent.base_url)
+        self.assertEqual(route.api_key, parent.api_key)
+        self.assertEqual(route.api_mode, parent.api_mode)
+        self.assertEqual(route.reasoning_config, {"enabled": True, "effort": "high"})
+
+    def test_named_lane_snapshots_absent_reasoning_for_every_child(self):
+        from tools.delegate_tool import _build_child_agent, _resolve_delegation_route
+
+        parent = _make_mock_parent()
+        parent.reasoning_config = None
+        route = _resolve_delegation_route(
+            {"lanes": {"review": {"model": "review-model"}}},
+            parent,
+            lane="review",
+        )
+
+        self.assertEqual(route.reasoning_config, {})
+        with patch("run_agent.AIAgent") as MockAgent:
+            for task_index, current_config in enumerate(
+                ({}, {"reasoning_effort": "high"})
+            ):
+                with patch(
+                    "tools.delegate_tool._load_config", return_value=current_config
+                ):
+                    _build_child_agent(
+                        task_index=task_index,
+                        goal="review",
+                        context=None,
+                        toolsets=None,
+                        model=route.model,
+                        max_iterations=10,
+                        parent_agent=parent,
+                        task_count=2,
+                        override_base_url=route.base_url,
+                        override_api_key=route.api_key,
+                        override_provider=route.provider,
+                        override_api_mode=route.api_mode,
+                        override_request_overrides=dict(route.request_overrides or {}),
+                        override_max_tokens=route.max_output_tokens,
+                        override_acp_command=route.command,
+                        override_acp_args=(
+                            list(route.args) if route.args is not None else None
+                        ),
+                        override_reasoning_config=route.reasoning_config,
+                        override_provider_routing=route.provider_routing,
+                        lane=route.lane,
+                    )
+
+        self.assertEqual(
+            [call.kwargs["reasoning_config"] for call in MockAgent.call_args_list],
+            [{}, {}],
+        )
+
+    def test_explicit_lane_provider_clears_inherited_direct_endpoint(self):
+        from tools.delegate_tool import _resolve_delegation_route
+
+        creds = {
+            "model": "review-model", "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1", "api_key": "lane-key",
+            "api_mode": "chat_completions", "request_overrides": {},
+            "max_output_tokens": None, "command": None, "args": [],
+        }
+        cfg = {
+            "base_url": "https://global-endpoint.example/v1",
+            "api_key": "global-key",
+            "api_mode": "anthropic_messages",
+            "lanes": {"review": {"provider": "openrouter", "model": "review-model"}},
+        }
+
+        parent = _make_mock_parent()
+        parent.providers_allowed = ["Anthropic"]
+        parent.openrouter_min_coding_score = 0.9
+        with patch("tools.delegate_tool._resolve_delegation_credentials", return_value=creds) as resolve:
+            route = _resolve_delegation_route(cfg, parent, lane="review")
+
+        selected = resolve.call_args.args[0]
+        self.assertEqual(selected["base_url"], "")
+        self.assertEqual(selected["api_key"], "")
+        self.assertEqual(selected["api_mode"], "")
+        self.assertEqual(route.provider_routing["providers_allowed"], None)
+        self.assertEqual(route.provider_routing["openrouter_min_coding_score"], None)
+
+    def test_real_temporary_hermes_home_routes_named_lane(self):
+        parent = _make_mock_parent()
+        with tempfile.TemporaryDirectory() as home:
+            config_path = os.path.join(home, "config.yaml")
+            with open(config_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "delegation:\n"
+                    "  model: global-model\n"
+                    "  base_url: https://delegation.example/v1\n"
+                    "  api_key: test-only-key\n"
+                    "  lanes:\n"
+                    "    review:\n"
+                    "      model: review-model\n"
+                    "      reasoning_effort: high\n"
+                )
+
+            with patch.dict(os.environ, {"HERMES_HOME": home}), patch("run_agent.AIAgent") as MockAgent:
+                child = MagicMock()
+                child.run_conversation.return_value = {
+                    "completed": True,
+                    "final_response": "clean",
+                    "api_calls": 1,
+                }
+                MockAgent.return_value = child
+
+                result = json.loads(delegate_task(goal="review", lane="review", parent_agent=parent))
+
+        kwargs = MockAgent.call_args.kwargs
+        self.assertEqual(kwargs["model"], "review-model")
+        self.assertEqual(kwargs["provider"], "custom")
+        self.assertEqual(kwargs["base_url"], "https://delegation.example/v1")
+        self.assertEqual(kwargs["reasoning_config"], {"enabled": True, "effort": "high"})
+        self.assertEqual(result["lane"], "review")
+        self.assertEqual(result["provider"], "custom")
+        self.assertEqual(result["model"], "review-model")
+
+    def test_unknown_lane_fails_before_spawn(self):
+        from tools.delegate_tool import _resolve_delegation_route
+
+        with self.assertRaisesRegex(ValueError, "Unknown delegation lane 'missing'"):
+            _resolve_delegation_route(
+                {"lanes": {"review": {"model": "review-model"}}},
+                _make_mock_parent(),
+                lane="missing",
+            )
+
+    def test_non_string_lane_selector_fails_before_spawn(self):
+        from tools.delegate_tool import _resolve_delegation_route
+
+        with self.assertRaisesRegex(ValueError, "must be a string"):
+            _resolve_delegation_route(
+                {"lanes": {"7": {"model": "review-model"}}},
+                _make_mock_parent(),
+                lane=7,  # type: ignore[arg-type]
+            )
+
+    def test_disabled_lane_fails_before_spawn(self):
+        from tools.delegate_tool import _resolve_delegation_route
+
+        with self.assertRaisesRegex(ValueError, "Delegation lane 'review' is disabled"):
+            _resolve_delegation_route(
+                {"lanes": {"review": {"enabled": False}}},
+                _make_mock_parent(),
+                lane="review",
+            )
+
+    def test_malformed_lane_fails_closed_before_spawn(self):
+        from tools.delegate_tool import _resolve_delegation_route
+
+        malformed_lanes = [
+            {"api_key": "synthetic-test-value", "model": "review-model"},
+            {"enabled": "yes", "model": "review-model"},
+            {"provider": ["openrouter"], "model": "review-model"},
+        ]
+
+        for lane_cfg in malformed_lanes:
+            with self.subTest(lane_cfg=lane_cfg):
+                with self.assertRaisesRegex(ValueError, "malformed"):
+                    _resolve_delegation_route(
+                        {"lanes": {"review": lane_cfg}},
+                        _make_mock_parent(),
+                        lane="review",
+                    )
+
+    def test_invalid_lane_reasoning_diagnostic_does_not_echo_value(self):
+        from tools.delegate_tool import _resolve_delegation_route
+
+        sentinel = "SENSITIVE_ROUTE_POLICY_VALUE"
+        with self.assertRaises(ValueError) as caught:
+            _resolve_delegation_route(
+                {"lanes": {"review": {"reasoning_effort": sentinel}}},
+                _make_mock_parent(),
+                lane="review",
+                config_snapshot={},
+            )
+
+        self.assertIn("reasoning_effort is invalid", str(caught.exception))
+        self.assertNotIn(sentinel, str(caught.exception))
+
+    def test_mixed_type_unknown_lane_fields_return_controlled_error(self):
+        from tools.delegate_tool import _resolve_delegation_route
+
+        sentinel = "SENTINEL_UNKNOWN_FIELD_SECRET"
+        with self.assertRaisesRegex(ValueError, "2 unknown field") as captured:
+            _resolve_delegation_route(
+                {"lanes": {"review": {7: "value", sentinel: "value"}}},
+                _make_mock_parent(),
+                lane="review",
+            )
+        self.assertNotIn(sentinel, str(captured.exception))
+
+    def test_named_route_http_policy_log_hides_exception_text(self):
+        from tools.delegate_tool import _snapshot_named_route_http_policy
+
+        sentinel = "SENTINEL_POLICY_SECRET"
+        with patch(
+            "hermes_cli.config.get_compatible_custom_providers",
+            side_effect=RuntimeError(sentinel),
+        ), self.assertLogs("tools.delegate_tool", level="DEBUG") as captured:
+            _snapshot_named_route_http_policy(
+                {"base_url": "https://route.invalid/v1"},
+                _make_mock_parent(),
+                inherit_parent_transport=False,
+                config_snapshot={},
+            )
+
+        log_text = "\n".join(captured.output)
+        self.assertIn("RuntimeError", log_text)
+        self.assertNotIn(sentinel, log_text)
+
+    @patch("tools.delegate_tool._resolve_child_credential_pool", return_value=None)
+    @patch("tools.delegate_tool._load_config", return_value={})
+    @patch("run_agent.AIAgent")
+    def test_named_lane_does_not_inherit_parent_transport_or_fallbacks(
+        self, mock_agent, _mock_cfg, _mock_pool
+    ):
+        parent = _make_mock_parent()
+        parent.provider = "xai-oauth"
+        parent.base_url = "https://parent-endpoint.invalid/v1"
+        parent.api_key = "***"
+        parent.api_mode = "anthropic_messages"
+        parent._fallback_chain = [
+            {"provider": "openrouter", "model": "fallback/model"}
+        ]
+        parent.providers_allowed = ["ParentOnly"]
+        parent.providers_ignored = ["LaneOnly"]
+        parent.providers_order = ["ParentOnly"]
+        parent.provider_sort = "throughput"
+        parent.provider_require_parameters = True
+        parent.provider_data_collection = "deny"
+        parent.openrouter_min_coding_score = 0.9
+        child = MagicMock()
+        child._credential_pool = "constructor-pool"
+        mock_agent.return_value = child
+        lane_overrides = {"headers": {"X-Lane": "original"}}
+
+        _build_child_agent(
+            task_index=0,
+            goal="review",
+            context=None,
+            toolsets=None,
+            model="grok-4.5",
+            max_iterations=10,
+            task_count=1,
+            parent_agent=parent,
+            override_provider="xai-oauth",
+            override_base_url=None,
+            override_api_key=None,
+            override_api_mode=None,
+            override_request_overrides=lane_overrides,
+            lane="review",
+        )
+        lane_overrides["headers"]["X-Lane"] = "mutated"
+
+        _, kwargs = mock_agent.call_args
+        self.assertIsNone(kwargs["base_url"])
+        self.assertIsNone(kwargs["api_key"])
+        self.assertIsNone(kwargs["api_mode"])
+        self.assertIsNone(kwargs["fallback_model"])
+        self.assertIsNone(kwargs["providers_allowed"])
+        self.assertIsNone(kwargs["providers_ignored"])
+        self.assertIsNone(kwargs["providers_order"])
+        self.assertIsNone(kwargs["provider_sort"])
+        self.assertIs(kwargs["provider_require_parameters"], False)
+        self.assertEqual(kwargs["provider_data_collection"], "")
+        self.assertIsNone(kwargs["openrouter_min_coding_score"])
+        self.assertEqual(
+            kwargs["request_overrides"]["headers"]["X-Lane"], "original"
+        )
+        self.assertIsNone(child._credential_pool)
+        _mock_pool.assert_not_called()
+
+    @patch("tools.delegate_tool._resolve_child_credential_pool", return_value=None)
+    @patch("tools.delegate_tool._load_config", return_value={})
+    @patch("run_agent.AIAgent")
+    def test_omitted_lane_direct_endpoint_inherits_parent_api_key(
+        self, mock_agent, _mock_cfg, _mock_pool
+    ):
+        parent = _make_mock_parent()
+        parent.api_key = "***"
+        mock_agent.return_value = MagicMock()
+
+        _build_child_agent(
+            task_index=0,
+            goal="legacy direct endpoint",
+            context=None,
+            toolsets=None,
+            model="legacy-model",
+            max_iterations=10,
+            task_count=1,
+            parent_agent=parent,
+            override_provider="custom",
+            override_base_url="https://delegation-endpoint.invalid/v1",
+            override_api_key=None,
+            override_api_mode="chat_completions",
+            lane=None,
+        )
+
+        _, kwargs = mock_agent.call_args
+        self.assertEqual(kwargs["api_key"], "***")
+
+    def test_model_only_lane_snapshots_parent_transport(self):
+        from tools.delegate_tool import _resolve_delegation_route
+
+        parent = _make_mock_parent()
+        parent.request_overrides = {"headers": {"X-Route": "original"}}
+        parent.max_tokens = 4096
+        parent.acp_command = None
+        parent.acp_args = []
+        parent.providers_allowed = ["Anthropic"]
+        parent.providers_ignored = ["Untrusted"]
+        parent.providers_order = ["Anthropic", "Google"]
+        parent.provider_sort = "throughput"
+        parent.provider_require_parameters = True
+        parent.provider_data_collection = "deny"
+        parent.openrouter_min_coding_score = 0.75
+        parent._client_kwargs = {
+            "default_headers": {"Authorization": "frozen-parent-header"},
+            "ssl_ca_cert": "/frozen/parent-ca.pem",
+            "ssl_verify": False,
+        }
+
+        route = _resolve_delegation_route(
+            {"lanes": {"review": {"model": "review-model"}}},
+            parent,
+            lane="review",
+        )
+        parent.provider = "mutated-provider"
+        parent.base_url = "https://mutated.invalid/v1"
+        parent.api_key = "mutated"
+        parent.api_mode = "mutated_mode"
+        parent.request_overrides["headers"]["X-Route"] = "mutated"
+        parent.providers_allowed.append("Mutated")
+        parent.providers_ignored = None
+        parent.providers_order.reverse()
+        parent.provider_sort = "price"
+        parent.provider_require_parameters = False
+        parent.provider_data_collection = "allow"
+        parent.openrouter_min_coding_score = 0.1
+        parent._client_kwargs["default_headers"]["Authorization"] = "mutated"
+        parent._client_kwargs["ssl_ca_cert"] = "/mutated/ca.pem"
+        parent._client_kwargs["ssl_verify"] = True
+
+        self.assertEqual(route.provider, "openrouter")
+        self.assertEqual(route.base_url, "https://openrouter.ai/api/v1")
+        self.assertEqual(route.api_key, "***")
+        self.assertEqual(route.api_mode, "chat_completions")
+        self.assertIsNotNone(route.request_overrides)
+        assert route.request_overrides is not None
+        self.assertEqual(route.request_overrides["headers"]["X-Route"], "original")
+        with self.assertRaises(TypeError):
+            route.request_overrides["headers"]["X-Route"] = "mutated"
+        self.assertEqual(route.provider_routing["providers_allowed"], ("Anthropic",))
+        self.assertEqual(route.provider_routing["providers_ignored"], ("Untrusted",))
+        self.assertEqual(
+            route.provider_routing["providers_order"], ("Anthropic", "Google")
+        )
+        self.assertEqual(route.provider_routing["provider_sort"], "throughput")
+        self.assertIs(route.provider_routing["provider_require_parameters"], True)
+        self.assertEqual(route.provider_routing["provider_data_collection"], "deny")
+        self.assertEqual(route.provider_routing["openrouter_min_coding_score"], 0.75)
+        self.assertIsNotNone(route.http_policy)
+        assert route.http_policy is not None
+        self.assertEqual(
+            route.http_policy["default_headers"]["Authorization"],
+            "frozen-parent-header",
+        )
+        self.assertEqual(route.http_policy["ssl_ca_cert"], "/frozen/parent-ca.pem")
+        self.assertIs(route.http_policy["ssl_verify"], False)
+        with self.assertRaises(TypeError):
+            route.http_policy["default_headers"]["Authorization"] = "mutated"
+
+        with patch("tools.delegate_tool._load_config", return_value={}), patch(
+            "run_agent.AIAgent"
+        ) as mock_agent:
+            mock_agent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="snapshot",
+                context=None,
+                toolsets=None,
+                model=route.model,
+                max_iterations=10,
+                task_count=1,
+                parent_agent=parent,
+                override_provider=route.provider,
+                override_base_url=route.base_url,
+                override_api_key=route.api_key,
+                override_api_mode=route.api_mode,
+                override_request_overrides=dict(route.request_overrides or {}),
+                override_max_tokens=route.max_output_tokens,
+                override_acp_command=route.command,
+                override_acp_args=list(route.args),
+                override_reasoning_config=route.reasoning_config,
+                override_provider_routing=route.provider_routing,
+                override_http_policy=route.http_policy,
+                lane=route.lane,
+            )
+
+        kwargs = mock_agent.call_args.kwargs
+        self.assertEqual(kwargs["provider"], "openrouter")
+        self.assertEqual(kwargs["base_url"], "https://openrouter.ai/api/v1")
+        self.assertEqual(kwargs["api_key"], "***")
+        self.assertEqual(kwargs["api_mode"], "chat_completions")
+        self.assertEqual(kwargs["request_overrides"]["headers"]["X-Route"], "original")
+        self.assertEqual(kwargs["providers_allowed"], ["Anthropic"])
+        self.assertEqual(kwargs["providers_ignored"], ["Untrusted"])
+        self.assertEqual(kwargs["providers_order"], ["Anthropic", "Google"])
+        self.assertEqual(kwargs["provider_sort"], "throughput")
+        self.assertIs(kwargs["provider_require_parameters"], True)
+        self.assertEqual(kwargs["provider_data_collection"], "deny")
+        self.assertEqual(kwargs["openrouter_min_coding_score"], 0.75)
+        self.assertEqual(
+            kwargs["frozen_http_policy"]["default_headers"]["Authorization"],
+            "frozen-parent-header",
+        )
+        self.assertEqual(
+            kwargs["frozen_http_policy"]["ssl_ca_cert"], "/frozen/parent-ca.pem"
+        )
+        self.assertIs(kwargs["frozen_http_policy"]["ssl_verify"], False)
+
+    def test_model_only_bedrock_lane_snapshots_parent_aws_route(self):
+        from tools.delegate_tool import _resolve_delegation_route
+
+        parent = _make_mock_parent()
+        parent.model = "amazon.nova-pro-v1:0"
+        parent.provider = "bedrock"
+        parent.base_url = "https://bedrock-runtime.us-east-1.amazonaws.com"
+        parent.api_key = "aws-sdk"
+        parent.api_mode = "bedrock_converse"
+        parent._frozen_bedrock_credentials = None
+        parent._bedrock_guardrail_config = {
+            "guardrailIdentifier": "guard-A",
+            "guardrailVersion": "1",
+        }
+        credential_snapshot = MagicMock()
+
+        with patch(
+            "agent.bedrock_adapter.capture_bedrock_credentials",
+            return_value=credential_snapshot,
+        ) as capture:
+            route = _resolve_delegation_route(
+                {"lanes": {"review": {"model": "amazon.nova-lite-v1:0"}}},
+                parent,
+                lane="review",
+                config_snapshot={},
+            )
+
+        capture.assert_called_once_with()
+        self.assertIs(route.bedrock_credentials, credential_snapshot)
+        self.assertEqual(
+            dict(route.bedrock_guardrail or {}),
+            {
+                "guardrailIdentifier": "guard-A",
+                "guardrailVersion": "1",
+            },
+        )
+
+    def test_provider_lane_snapshots_selected_http_policy_once(self):
+        from tools.delegate_tool import _resolve_delegation_route
+
+        endpoint = "https://lane-policy.invalid/v1"
+        full_config = {
+            "model": {
+                "default_headers": {"X-Global": "before", "X-Winner": "global"}
+            },
+            "custom_providers": [
+                {
+                    "name": "review-provider",
+                    "base_url": endpoint,
+                    "api_key": "secret",
+                    "extra_headers": {"X-Winner": "provider", "X-Lane": "before"},
+                    "ssl_ca_cert": "/frozen/lane-ca.pem",
+                    "ssl_verify": False,
+                }
+            ],
+        }
+        creds = {
+            "model": "review-model",
+            "provider": "custom",
+            "base_url": endpoint,
+            "api_key": "secret",
+            "api_mode": "chat_completions",
+            "request_overrides": {},
+            "extra_headers": {"X-Runtime": "before"},
+            "max_output_tokens": None,
+            "command": None,
+            "args": [],
+        }
+        with patch(
+            "tools.delegate_tool._resolve_delegation_credentials",
+            return_value=creds,
+        ), patch(
+            "hermes_cli.config.load_config_readonly", return_value=full_config
+        ):
+            route = _resolve_delegation_route(
+                {
+                    "lanes": {
+                        "review": {
+                            "provider": "review-provider",
+                            "model": "review-model",
+                        }
+                    }
+                },
+                _make_mock_parent(),
+                lane="review",
+            )
+
+        full_config["model"]["default_headers"]["X-Global"] = "after"
+        full_config["custom_providers"][0]["extra_headers"]["X-Lane"] = "after"
+        full_config["custom_providers"][0]["ssl_verify"] = True
+
+        policy = route.http_policy
+        self.assertIsNotNone(policy)
+        assert policy is not None
+        self.assertEqual(policy["default_headers"]["X-Global"], "before")
+        self.assertEqual(policy["default_headers"]["X-Winner"], "provider")
+        self.assertEqual(policy["default_headers"]["X-Lane"], "before")
+        self.assertEqual(policy["default_headers"]["X-Runtime"], "before")
+        self.assertEqual(policy["ssl_ca_cert"], "/frozen/lane-ca.pem")
+        self.assertIs(policy["ssl_verify"], False)
+
+    def test_provider_lane_uses_one_config_snapshot_for_credentials_and_policy(self):
+        from tools.delegate_tool import _resolve_delegation_route
+
+        endpoint = "https://coherent-policy.invalid/v1"
+        source_config = {
+            "model": {"default_headers": {"X-Global": "before"}},
+            "custom_providers": [
+                {
+                    "name": "review-provider",
+                    "base_url": endpoint,
+                    "api_key": "old-key",
+                    "extra_headers": {"Authorization": "Bearer old"},
+                    "ssl_verify": False,
+                }
+            ],
+        }
+
+        def resolve_runtime_provider(**_kwargs):
+            source_config["model"]["default_headers"]["X-Global"] = "after"
+            provider = source_config["custom_providers"][0]
+            provider["api_key"] = "new-key"
+            provider["extra_headers"]["Authorization"] = "Bearer new"
+            provider["ssl_verify"] = True
+            return {
+                "provider": "custom",
+                "model": "review-model",
+                "base_url": endpoint,
+                "api_key": "old-key",
+                "api_mode": "chat_completions",
+                "extra_headers": {"Authorization": "Bearer old"},
+            }
+
+        with patch(
+            "hermes_cli.config.load_config_readonly", return_value=source_config
+        ), patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            side_effect=resolve_runtime_provider,
+        ):
+            route = _resolve_delegation_route(
+                {
+                    "lanes": {
+                        "review": {
+                            "provider": "review-provider",
+                            "model": "review-model",
+                        }
+                    }
+                },
+                _make_mock_parent(),
+                lane="review",
+            )
+
+        assert route.http_policy is not None
+        headers = route.http_policy["default_headers"]
+        self.assertEqual(route.api_key, "old-key")
+        self.assertEqual(headers["X-Global"], "before")
+        self.assertEqual(headers["Authorization"], "Bearer old")
+        self.assertIs(route.http_policy["ssl_verify"], False)
+
+    def test_bedrock_lane_forwards_frozen_credentials_and_guardrail_to_child(self):
+        from tools.delegate_tool import _build_child_agent, _resolve_delegation_route
+
+        credential_snapshot = MagicMock()
+        guardrail = {
+            "guardrailIdentifier": "guard-A",
+            "guardrailVersion": "1",
+        }
+        creds = {
+            "model": "amazon.nova-pro-v1:0",
+            "provider": "bedrock",
+            "base_url": "https://bedrock-runtime.us-east-1.amazonaws.com",
+            "api_key": "aws-sdk",
+            "api_mode": "bedrock_converse",
+            "request_overrides": {},
+            "max_output_tokens": None,
+            "command": None,
+            "args": [],
+            "bedrock_credentials": credential_snapshot,
+            "bedrock_guardrail_config": guardrail,
+        }
+        with patch(
+            "tools.delegate_tool._resolve_delegation_credentials",
+            return_value=creds,
+        ), patch(
+            "hermes_cli.config.load_config_readonly", return_value={}
+        ):
+            route = _resolve_delegation_route(
+                {
+                    "lanes": {
+                        "review": {
+                            "provider": "bedrock",
+                            "model": "amazon.nova-pro-v1:0",
+                        }
+                    }
+                },
+                _make_mock_parent(),
+                lane="review",
+            )
+
+        guardrail["guardrailIdentifier"] = "guard-B"
+        self.assertIs(route.bedrock_credentials, credential_snapshot)
+        self.assertIsNotNone(route.bedrock_guardrail)
+        assert route.bedrock_guardrail is not None
+        self.assertEqual(route.bedrock_guardrail["guardrailIdentifier"], "guard-A")
+
+        with patch("tools.delegate_tool._load_config", return_value={}), patch(
+            "run_agent.AIAgent"
+        ) as mock_agent:
+            mock_agent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="snapshot",
+                context=None,
+                toolsets=None,
+                model=route.model,
+                max_iterations=10,
+                task_count=1,
+                parent_agent=_make_mock_parent(),
+                override_provider=route.provider,
+                override_base_url=route.base_url,
+                override_api_key=route.api_key,
+                override_api_mode=route.api_mode,
+                override_bedrock_credentials=route.bedrock_credentials,
+                override_bedrock_guardrail=route.bedrock_guardrail,
+                lane=route.lane,
+            )
+
+        kwargs = mock_agent.call_args.kwargs
+        self.assertIs(kwargs["frozen_bedrock_credentials"], credential_snapshot)
+        self.assertEqual(
+            kwargs["frozen_bedrock_guardrail"]["guardrailIdentifier"], "guard-A"
+        )
+
+    def test_failed_child_preserves_precise_reported_exit_reason(self):
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child._delegate_lane = "review"
+        child._delegate_provider = "anthropic"
+        child._delegate_model = "claude"
+        child._delegate_public_sanitizer = None
+        child._credential_pool = None
+        child._subagent_id = None
+        child.tool_progress_callback = None
+        child.run_conversation.return_value = {
+            "status": "failed",
+            "exit_reason": "timeout",
+            "completed": False,
+            "failed": True,
+            "final_response": None,
+            "error": "deadline exceeded",
+        }
+
+        entry = _run_single_child(0, "probe", child=child)
+
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(entry["exit_reason"], "timeout")
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    @patch("run_agent.AIAgent")
+    def test_omitted_lane_preserves_parent_acp_arguments(self, mock_agent, _mock_config):
+        parent = _make_mock_parent()
+        parent.acp_command = "copilot"
+        parent.acp_args = ["--stdio", "--profile", "work"]
+        child = MagicMock()
+        child.run_conversation.return_value = {
+            "completed": True,
+            "final_response": "done",
+            "api_calls": 1,
+        }
+        mock_agent.return_value = child
+
+        delegate_task(goal="legacy ACP route", parent_agent=parent)
+
+        kwargs = mock_agent.call_args.kwargs
+        self.assertEqual(kwargs["acp_command"], "copilot")
+        self.assertEqual(kwargs["acp_args"], ["--stdio", "--profile", "work"])
+
+    @patch("tools.delegate_tool._run_single_child", side_effect=RuntimeError("worker failed"))
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
+    def test_batch_future_exception_preserves_route_identity(
+        self, mock_agent, mock_config, _mock_run
+    ):
+        mock_config.return_value = {
+            "base_url": "https://delegation.example/v1",
+            "api_key": "***",
+            "lanes": {"review": {"model": "review-model"}},
+        }
+        mock_agent.return_value = MagicMock()
+
+        result = json.loads(delegate_task(
+            tasks=[{"goal": "one"}, {"goal": "two"}],
+            lane="review",
+            parent_agent=_make_mock_parent(),
+        ))
+
+        self.assertEqual(len(result["results"]), 2)
+        for entry in result["results"]:
+            self.assertEqual(entry["lane"], "review")
+            self.assertEqual(entry["provider"], "custom")
+            self.assertEqual(entry["model"], "review-model")
+            self.assertEqual(entry["status"], "failed")
+            self.assertEqual(entry["exit_reason"], "error")
+            self.assertNotIn("worker failed", entry["error"])
+
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_route_repr_redacts_connection_details(self, mock_creds):
+        from tools.delegate_tool import _resolve_delegation_route
+
+        mock_creds.return_value = {
+            "model": "review-model",
+            "provider": "custom",
+            "base_url": "https://sensitive-endpoint.invalid/v1",
+            "api_key": "SENSITIVE_SENTINEL",
+            "api_mode": "SENSITIVE_API_MODE",
+            "request_overrides": {"headers": {"Authorization": "SENSITIVE_HEADER"}},
+            "max_output_tokens": 7654321,
+            "command": "sensitive-command",
+            "args": ["--secret", "SENSITIVE_ARG"],
+        }
+
+        parent = _make_mock_parent()
+        parent.reasoning_config = {"secret": "SENSITIVE_REASONING"}
+        route = _resolve_delegation_route(
+            {"lanes": {"review": {"model": "review-model"}}},
+            parent,
+            lane="review",
+        )
+
+        rendered = repr(route)
+        self.assertEqual(
+            rendered,
+            "DelegationRoute(lane='review', model='review-model', provider='custom')",
+        )
+
+    def test_named_route_resolved_absence_stays_absent_in_progress_metadata(self):
+        from tools.delegate_tool import _build_child_agent, _resolve_delegation_route
+
+        parent = _make_mock_parent()
+        parent.model = None
+        parent.provider = None
+        parent.acp_command = None
+        parent.acp_args = []
+        parent.tool_progress_callback = MagicMock()
+        route = _resolve_delegation_route(
+            {"lanes": {"review": {}}}, parent, lane="review"
+        )
+        self.assertIsNone(route.resolved_model)
+        self.assertIsNone(route.resolved_provider)
+
+        parent.model = "MUTATED_MODEL"
+        parent.provider = "MUTATED_PROVIDER"
+        with patch("run_agent.AIAgent", return_value=MagicMock()):
+            _build_child_agent(
+                task_index=0,
+                goal="review",
+                context=None,
+                toolsets=None,
+                model=route.model,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                override_base_url=route.base_url,
+                override_api_key=route.api_key,
+                override_provider=route.provider,
+                override_api_mode=route.api_mode,
+                override_request_overrides=dict(route.request_overrides or {}),
+                override_max_tokens=route.max_output_tokens,
+                override_acp_command=route.command,
+                override_acp_args=(list(route.args) if route.args is not None else None),
+                override_reasoning_config=route.reasoning_config,
+                override_provider_routing=route.provider_routing,
+                lane=route.lane,
+            )
+
+        spawn_call = next(
+            call
+            for call in parent.tool_progress_callback.call_args_list
+            if call.args and call.args[0] == "subagent.spawn_requested"
+        )
+        self.assertIsNone(spawn_call.kwargs.get("provider"))
+        self.assertIsNone(spawn_call.kwargs.get("model"))
+
+    def test_named_route_normalizes_blank_inherited_identity_to_none(self):
+        from tools.delegate_tool import _resolve_delegation_route
+
+        parent = _make_mock_parent()
+        parent.model = "   "
+        parent.provider = ""
+        parent.acp_command = None
+        parent.acp_args = []
+
+        route = _resolve_delegation_route(
+            {"lanes": {"review": {}}}, parent, lane="review"
+        )
+
+        self.assertIsNone(route.model)
+        self.assertIsNone(route.provider)
+        self.assertIsNone(route.resolved_model)
+        self.assertIsNone(route.resolved_provider)
+
+    def test_omitted_lane_preserves_global_route(self):
+        from tools.delegate_tool import _resolve_delegation_route
+
+        route = _resolve_delegation_route(
+            {"model": "global-model", "reasoning_effort": "medium"},
+            _make_mock_parent(),
+        )
+
+        self.assertIsNone(route.lane)
+        self.assertEqual(route.model, "global-model")
+        self.assertEqual(route.reasoning_config, {"enabled": True, "effort": "medium"})
+
+    def test_omitted_lane_preserves_unresolved_absent_reasoning(self):
+        from tools.delegate_tool import _resolve_delegation_route
+
+        parent = _make_mock_parent()
+        parent.reasoning_config = None
+        route = _resolve_delegation_route({}, parent)
+
+        self.assertIsNone(route.lane)
+        self.assertIsNone(route.reasoning_config)
+
+    def test_child_constructor_failure_aborts_batch_without_secret_leak(self):
+        parent = _make_mock_parent()
+        parent._active_children = []
+        parent.tool_progress_callback = MagicMock()
+        parent.acp_command = None
+        parent.acp_args = []
+        first_child = MagicMock()
+        first_child.session_id = "child-first"
+        sentinel = "SENTINEL_CONSTRUCTOR_SECRET_https://secret.invalid/key"
+        cfg = {"lanes": {"review": {"model": "review-model"}}}
+
+        with patch("tools.delegate_tool._load_config", return_value=cfg), patch(
+            "run_agent.AIAgent",
+            side_effect=[first_child, RuntimeError(sentinel)],
+        ), patch(
+            "tools.async_delegation.dispatch_async_delegation_batch"
+        ) as dispatch_async, self.assertLogs(
+            "tools.delegate_tool", level="ERROR"
+        ) as captured:
+            result = json.loads(
+                delegate_task(
+                    tasks=[{"goal": "first"}, {"goal": "second"}],
+                    lane="review",
+                    background=True,
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertEqual(len(result["results"]), 2)
+        self.assertEqual(
+            [entry["status"] for entry in result["results"]], ["failed", "failed"]
+        )
+        self.assertEqual(
+            [entry["exit_reason"] for entry in result["results"]],
+            ["error", "error"],
+        )
+        self.assertNotIn(sentinel, json.dumps(result))
+        self.assertNotIn(sentinel, "\n".join(captured.output))
+        self.assertEqual(parent._active_children, [])
+        first_child.close.assert_called_once()
+        dispatch_async.assert_not_called()
+        progress_calls = parent.tool_progress_callback.call_args_list
+        spawned = [call for call in progress_calls if call.args[0] == "subagent.spawn_requested"]
+        completed = [call for call in progress_calls if call.args[0] == "subagent.complete"]
+        self.assertEqual(len(spawned), 1)
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(completed[0].kwargs["status"], "failed")
+        self.assertEqual(completed[0].kwargs["lane"], result["lane"])
+        self.assertEqual(completed[0].kwargs["provider"], result["provider"])
+        self.assertEqual(completed[0].kwargs["model"], result["model"])
+
+    def test_lifecycle_hooks_keep_route_identity_and_hide_exception_text(self):
+        parent = _make_mock_parent()
+        parent.acp_command = None
+        parent.acp_args = []
+        child = MagicMock()
+        child.session_id = "child-hook"
+        child.run_conversation.return_value = {
+            "final_response": "done", "completed": True, "api_calls": 1,
+        }
+        sentinel = "SENTINEL_HOOK_SECRET_https://secret.invalid/key"
+        hook_calls = []
+
+        def failing_hook(name, **kwargs):
+            hook_calls.append((name, kwargs))
+            raise RuntimeError(sentinel)
+
+        cfg = {"lanes": {"review": {"model": "review-model"}}}
+        with patch("tools.delegate_tool._load_config", return_value=cfg), patch(
+            "run_agent.AIAgent", return_value=child
+        ), patch("hermes_cli.plugins.invoke_hook", side_effect=failing_hook), self.assertLogs(
+            "tools.delegate_tool", level="DEBUG"
+        ) as captured:
+            result = json.loads(
+                delegate_task(goal="review", lane="review", parent_agent=parent)
+            )
+
+        self.assertEqual(result["results"][0]["status"], "completed")
+        by_name = {name: kwargs for name, kwargs in hook_calls}
+        for hook_name in ("subagent_start", "subagent_stop"):
+            self.assertEqual(by_name[hook_name]["child_lane"], "review")
+            self.assertEqual(by_name[hook_name]["child_provider"], result["provider"])
+            self.assertEqual(by_name[hook_name]["child_model"], result["model"])
+        self.assertNotIn(sentinel, "\n".join(captured.output))
+
+    def test_failed_child_payload_is_sanitized_before_every_public_surface(self):
+        parent = _make_mock_parent()
+        parent.acp_command = None
+        parent.acp_args = []
+        parent.tool_progress_callback = MagicMock()
+        child = MagicMock()
+        child.session_id = "child-failed-payload"
+        sentinel = (
+            "https://secret.invalid/v1 api_mode=private-wire api-key "
+            "request_override fallback-command --secret-arg"
+        )
+        child.run_conversation.return_value = {
+            "final_response": sentinel,
+            "error": sentinel,
+            "completed": False,
+            "failed": True,
+            "api_calls": 1,
+            "messages": [],
+        }
+        cfg = {"lanes": {"review": {"model": "review-model"}}}
+
+        with patch("tools.delegate_tool._load_config", return_value=cfg), patch(
+            "run_agent.AIAgent", return_value=child
+        ):
+            result = json.loads(
+                delegate_task(goal="review", lane="review", parent_agent=parent)
+            )
+
+        entry = result["results"][0]
+        self.assertEqual(entry["status"], "failed")
+        self.assertIsNone(entry["summary"])
+        self.assertNotIn(sentinel, json.dumps(result))
+        self.assertNotIn(
+            sentinel,
+            json.dumps(
+                [
+                    {"args": call.args, "kwargs": call.kwargs}
+                    for call in parent.tool_progress_callback.call_args_list
+                ],
+                default=str,
+            ),
+        )
+        for transcript in result.get("live_transcripts", []):
+            self.assertNotIn(sentinel, Path(transcript).read_text(encoding="utf-8"))
+
+    def test_explicit_terminal_failure_status_overrides_success_flags(self):
+        sentinel = "https://route-secret.invalid/v9 credential=private-value"
+        cfg = {"lanes": {"review": {"model": "review-model"}}}
+
+        for explicit_status in (
+            "failed",
+            "error",
+            "timeout",
+            "interrupted",
+            "cancelled",
+        ):
+            with self.subTest(status=explicit_status):
+                parent = _make_mock_parent()
+                parent.acp_command = None
+                parent.acp_args = []
+                parent.tool_progress_callback = MagicMock()
+                child = MagicMock()
+                child.session_id = f"child-{explicit_status}"
+                child.run_conversation.return_value = {
+                    "status": explicit_status,
+                    "final_response": sentinel,
+                    "completed": True,
+                    "failed": False,
+                    "error": None,
+                    "api_calls": 1,
+                    "messages": [],
+                }
+
+                with patch(
+                    "tools.delegate_tool._load_config", return_value=cfg
+                ), patch("run_agent.AIAgent", return_value=child):
+                    result = json.loads(
+                        delegate_task(
+                            goal="review", lane="review", parent_agent=parent
+                        )
+                    )
+
+                entry = result["results"][0]
+                expected = (
+                    "interrupted"
+                    if explicit_status in {"interrupted", "cancelled"}
+                    else "failed"
+                )
+                self.assertEqual(entry["status"], expected)
+                self.assertIsNone(entry["summary"])
+                self.assertNotIn(sentinel, json.dumps(result))
+                self.assertNotIn(
+                    sentinel,
+                    json.dumps(
+                        [
+                            {"args": call.args, "kwargs": call.kwargs}
+                            for call in parent.tool_progress_callback.call_args_list
+                        ],
+                        default=str,
+                    ),
+                )
+
+    def test_named_lane_redacts_frozen_route_values_from_live_child_events(self):
+        endpoint = "https://route-secret.invalid/v9"
+        api_key = "route-api-key-Z9X8"
+        api_mode = "xyz"
+        override_value = "request-override-Z9X8"
+        routing_value = "private-upstream-Z9X8"
+        acp_command = "sh"
+        acp_arg = "AA"
+        leaked_text = " ".join(
+            (
+                endpoint,
+                api_key,
+                api_mode,
+                override_value,
+                routing_value,
+                acp_command,
+                acp_arg,
+            )
+        )
+        cfg = {"lanes": {"review": {"model": "review-model"}}}
+        parent = _make_mock_parent()
+        parent.provider = "openai-codex"
+        parent.base_url = endpoint
+        parent.api_key = api_key
+        parent.api_mode = api_mode
+        parent._client_kwargs = {"base_url": endpoint, "api_key": api_key}
+        parent.request_overrides = {"private_override": override_value}
+        parent.providers_order = [routing_value]
+        parent.acp_command = acp_command
+        parent.acp_args = [acp_arg]
+        parent.tool_progress_callback = MagicMock()
+
+        child = MagicMock()
+        child.session_id = "child-stream-redaction"
+
+        def run_child(**kwargs):
+            child.tool_progress_callback(
+                "tool_start",
+                leaked_text,
+                leaked_text,
+                MappingProxyType(
+                    {
+                        "nested": MappingProxyType({api_key: leaked_text}),
+                        "bytes": api_key.encode("utf-8"),
+                        "frozen": frozenset({api_key}),
+                    }
+                ),
+                secret_kwarg=leaked_text,
+            )
+            split_at = len(api_key) // 2
+            kwargs["stream_callback"](api_key[:split_at])
+            kwargs["stream_callback"](api_key[split_at:])
+            kwargs["stream_callback"]("A")
+            kwargs["stream_callback"]("A")
+            kwargs["stream_callback"]("!")
+            return {
+                "status": "failed",
+                "final_response": leaked_text,
+                "completed": False,
+                "failed": True,
+                "error": leaked_text,
+                "api_calls": 1,
+                "messages": [],
+            }
+
+        child.run_conversation.side_effect = run_child
+        with patch("tools.delegate_tool._load_config", return_value=cfg), patch(
+            "run_agent.AIAgent", return_value=child
+        ):
+            result = json.loads(
+                delegate_task(goal="review", lane="review", parent_agent=parent)
+            )
+
+        rendered_events = json.dumps(
+            [
+                {"args": call.args, "kwargs": call.kwargs}
+                for call in parent.tool_progress_callback.call_args_list
+            ],
+            default=str,
+        )
+        reconstructed_stream = "".join(
+            call.args[2] or ""
+            for call in parent.tool_progress_callback.call_args_list
+            if call.args and call.args[0] == "subagent.text"
+        )
+        for secret in (
+            endpoint,
+            api_key,
+            api_mode,
+            override_value,
+            routing_value,
+            acp_command,
+            acp_arg,
+        ):
+            self.assertNotIn(secret, rendered_events)
+            self.assertNotIn(secret, reconstructed_stream)
+            self.assertNotIn(secret, json.dumps(result))
+            for transcript in result.get("live_transcripts", []):
+                self.assertNotIn(
+                    secret, Path(transcript).read_text(encoding="utf-8")
+                )
+
+    def test_named_lane_freezes_and_redacts_binary_route_values(self):
+        from tools.delegate_tool import (
+            _resolve_delegation_route,
+            _route_publication_sanitizer,
+        )
+
+        secret = b"binary-route-secret-Z9X8"
+        mutable_secret = bytearray(secret)
+        parent = _make_mock_parent()
+        parent.request_overrides = {"opaque": mutable_secret}
+        route = _resolve_delegation_route(
+            {"lanes": {"review": {"model": "review-model"}}},
+            parent,
+            lane="review",
+        )
+
+        self.assertIsNotNone(route.request_overrides)
+        frozen_secret = route.request_overrides["opaque"]
+        self.assertIsInstance(frozen_secret, bytes)
+        mutable_secret[0] = ord("X")
+        self.assertEqual(frozen_secret, secret)
+
+        sanitize = _route_publication_sanitizer(route)
+        sanitized = sanitize({"bytes": secret, "bytearray": bytearray(secret)})
+        self.assertNotIn(secret, sanitized["bytes"])
+        self.assertNotIn(secret, bytes(sanitized["bytearray"]))
+
+    def test_named_lane_redacts_each_callable_credential_value_used_by_transport(self):
+        from tools.delegate_tool import (
+            _resolve_delegation_route,
+            _route_publication_sanitizer,
+        )
+
+        tokens = iter(("ENTRA_TOKEN_GENERATION_A", "ENTRA_TOKEN_GENERATION_B"))
+        provider = lambda: next(tokens)
+        with patch(
+            "tools.delegate_tool._resolve_delegation_credentials",
+            return_value={
+                "provider": "azure-foundry",
+                "model": "azure-model",
+                "api_key": provider,
+            },
+        ):
+            route = _resolve_delegation_route(
+                {
+                    "lanes": {
+                        "review": {
+                            "provider": "azure-foundry",
+                            "model": "azure-model",
+                        }
+                    }
+                },
+                _make_mock_parent(),
+                lane="review",
+                config_snapshot={},
+            )
+
+        sanitize = _route_publication_sanitizer(route)
+        first = route.api_key()
+        second = route.api_key()
+        published = sanitize(f"provider echoed {first} and {second}")
+
+        self.assertNotIn(first, published)
+        self.assertNotIn(second, published)
+
+    def test_loaded_delegation_view_retains_one_full_config_generation(self):
+        from tools.delegate_tool import _load_config, _resolve_delegation_route
+
+        generation_a = {
+            "delegation": {
+                "lanes": {
+                    "review": {
+                        "provider": "custom:review",
+                        "model": "model-a",
+                    }
+                }
+            },
+            "custom_providers": [
+                {
+                    "name": "review",
+                    "base_url": "https://generation-a.invalid/v1",
+                    "api_key": "key-a",
+                }
+            ],
+        }
+        generation_b = {
+            "custom_providers": [
+                {
+                    "name": "review",
+                    "base_url": "https://generation-b.invalid/v1",
+                    "api_key": "key-b",
+                }
+            ]
+        }
+        with patch("hermes_cli.config.load_config_readonly", return_value=generation_a):
+            delegation_cfg = _load_config()
+        full_snapshot = getattr(delegation_cfg, "_full_config_snapshot")
+        parent = _make_mock_parent()
+        with patch("hermes_cli.config.load_config_readonly", return_value=generation_b):
+            route = _resolve_delegation_route(
+                delegation_cfg,
+                parent,
+                lane="review",
+                config_snapshot=full_snapshot,
+            )
+
+        self.assertEqual(route.model, "model-a")
+        self.assertEqual(route.base_url, "https://generation-a.invalid/v1")
+        self.assertEqual(route.api_key, "key-a")
+
+    def test_route_sanitizer_does_not_corrupt_benign_reasoning_prose(self):
+        from tools.delegate_tool import _resolve_delegation_route, _route_publication_sanitizer
+
+        route = _resolve_delegation_route(
+            {
+                "lanes": {
+                    "review": {"model": "review-model", "reasoning_effort": "high"}
+                }
+            },
+            _make_mock_parent(),
+            lane="review",
+        )
+        sanitize = _route_publication_sanitizer(route)
+        text = "The high-risk path needs effort and high confidence."
+
+        self.assertEqual(sanitize(text), text)
+
+    def test_successful_named_lane_summary_redacts_frozen_route_values(self):
+        endpoint = "https://success-route-secret.invalid/v9"
+        api_key = "successful-route-api-key-Z9X8"
+        cfg = {"lanes": {"review": {"model": "review-model"}}}
+        parent = _make_mock_parent()
+        parent.base_url = endpoint
+        parent.api_key = api_key
+        parent._client_kwargs = {"base_url": endpoint, "api_key": api_key}
+        child = MagicMock()
+        child.session_id = "child-success-redaction"
+        child.run_conversation.return_value = {
+            "status": "completed",
+            "final_response": f"done via {endpoint} using {api_key}",
+            "completed": True,
+            "failed": False,
+            "api_calls": 1,
+            "messages": [],
+        }
+
+        with patch("tools.delegate_tool._load_config", return_value=cfg), patch(
+            "run_agent.AIAgent", return_value=child
+        ):
+            result = json.loads(
+                delegate_task(goal="review", lane="review", parent_agent=parent)
+            )
+
+        rendered = json.dumps(result)
+        self.assertNotIn(endpoint, rendered)
+        self.assertNotIn(api_key, rendered)
+        self.assertEqual(result["results"][0]["status"], "completed")
+
+    def test_successful_named_lane_sanitizes_trace_and_file_reminder(self):
+        api_key = "successful-route-api-key-TRACE-Z9X8"
+        secret_path = f"/tmp/{api_key}.txt"
+        cfg = {"lanes": {"review": {"model": "review-model"}}}
+        parent = _make_mock_parent()
+        parent.api_key = api_key
+        parent._client_kwargs = {"api_key": api_key}
+        parent._current_task_id = "parent-task"
+        child = MagicMock()
+        child.session_id = "child-success-metadata-redaction"
+        child.run_conversation.return_value = {
+            "status": "completed",
+            "final_response": "done",
+            "completed": True,
+            "failed": False,
+            "api_calls": 1,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "tc-secret",
+                            "function": {"name": api_key, "arguments": "{}"},
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with patch("tools.delegate_tool._load_config", return_value=cfg), patch(
+            "tools.delegate_tool.file_state.known_reads", return_value=[secret_path]
+        ), patch(
+            "tools.delegate_tool.file_state.writes_since",
+            return_value={"child-task": [secret_path]},
+        ), patch("run_agent.AIAgent", return_value=child):
+            result = json.loads(
+                delegate_task(goal="review", lane="review", parent_agent=parent)
+            )
+
+        self.assertNotIn(api_key, json.dumps(result))
+
+
 class TestDelegationCredentialResolution(unittest.TestCase):
     """Tests for provider:model credential resolution in delegation config."""
+
+    def test_different_provider_pool_failure_logs_exception_type_only(self):
+        from tools.delegate_tool import _resolve_child_credential_pool
+
+        parent = _make_mock_parent()
+        parent.provider = "parent-provider"
+        parent._credential_pool = None
+        sentinel = "SENTINEL_POOL_SECRET_https://secret.invalid/key"
+        with patch(
+            "agent.credential_pool.load_pool", side_effect=RuntimeError(sentinel)
+        ), self.assertLogs("tools.delegate_tool", level="DEBUG") as captured:
+            pool = _resolve_child_credential_pool("different-provider", parent)
+
+        self.assertIsNone(pool)
+        self.assertNotIn(sentinel, "\n".join(captured.output))
 
     def test_no_provider_returns_none_credentials(self):
         """When delegation.provider is empty, all credentials are None (inherit parent)."""
@@ -1301,13 +2946,15 @@ class TestDelegationCredentialResolution(unittest.TestCase):
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_provider_resolution_failure_raises_valueerror(self, mock_resolve):
         """When provider resolution fails, ValueError is raised with helpful message."""
-        mock_resolve.side_effect = RuntimeError("OPENROUTER_API_KEY not set")
+        sentinel = "https://secret.invalid/v1 api-key acp-command --secret-arg"
+        mock_resolve.side_effect = RuntimeError(sentinel)
         parent = _make_mock_parent(depth=0)
         cfg = {"model": "some-model", "provider": "openrouter"}
         with self.assertRaises(ValueError) as ctx:
             _resolve_delegation_credentials(cfg, parent)
         self.assertIn("openrouter", str(ctx.exception).lower())
         self.assertIn("Cannot resolve", str(ctx.exception))
+        self.assertNotIn(sentinel, str(ctx.exception))
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_provider_resolves_but_no_api_key_raises(self, mock_resolve):
@@ -1964,6 +3611,20 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
 
         self.assertIsNone(result)
 
+    def test_custom_pool_failure_log_does_not_disclose_endpoint(self):
+        parent = _make_mock_parent()
+        endpoint = "https://sensitive-route.invalid/v1"
+
+        with patch(
+            "agent.credential_pool.get_custom_provider_pool_key",
+            side_effect=RuntimeError(f"failed for {endpoint}"),
+        ), self.assertLogs("tools.delegate_tool", level="DEBUG") as captured:
+            result = _resolve_child_credential_pool("custom", parent, endpoint)
+
+        self.assertIsNone(result)
+        rendered = "\n".join(captured.output)
+        self.assertNotIn(endpoint, rendered)
+
     def test_build_child_agent_assigns_parent_pool_when_shared(self):
         parent = _make_mock_parent()
         mock_pool = MagicMock()
@@ -2087,7 +3748,8 @@ class TestChildCredentialLeasing(unittest.TestCase):
             parent_agent=_make_mock_parent(),
         )
 
-        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["exit_reason"], "error")
         child._credential_pool.release_lease.assert_called_once_with("cred-a")
 
 
@@ -2201,7 +3863,8 @@ class TestDelegateHeartbeat(unittest.TestCase):
                 parent_agent=parent,
             )
 
-        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["exit_reason"], "error")
 
         # Verify heartbeat stopped
         count_after = len(touch_calls)
@@ -2418,6 +4081,23 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
 
+    def test_named_lane_is_forwarded_by_live_dispatch(self):
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                _make_mock_parent(depth=0),
+                {"goal": "review", "lane": "review"},
+            )
+
+        self.assertEqual(captured["lane"], "review")
+
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
 
@@ -2511,6 +4191,39 @@ class TestDelegateEventEnum(unittest.TestCase):
             "💭" in str(c)
             for c in parent._delegate_spinner.print_above.call_args_list
         )
+
+    def test_progress_callback_relays_resolved_lane_provider_and_model(self):
+        parent = _make_mock_parent()
+        parent.tool_progress_callback = MagicMock()
+
+        cb = _build_child_progress_callback(
+            0,
+            "review proposal",
+            parent,
+            task_count=1,
+            lane="review",
+            provider="xai-oauth",
+            model="grok-4.5",
+        )
+
+        cb("subagent.spawn_requested", preview="review proposal")
+        payload = parent.tool_progress_callback.call_args.kwargs
+        self.assertEqual(payload["lane"], "review")
+        self.assertEqual(payload["provider"], "xai-oauth")
+        self.assertEqual(payload["model"], "grok-4.5")
+
+    def test_spawn_requested_and_start_print_only_one_classic_cli_line(self):
+        parent = _make_mock_parent()
+        parent._delegate_spinner = MagicMock()
+        parent.tool_progress_callback = MagicMock()
+
+        cb = _build_child_progress_callback(0, "review", parent, task_count=1)
+        assert cb is not None
+        cb("subagent.spawn_requested", preview="review")
+        cb("subagent.start", preview="review")
+
+        parent._delegate_spinner.print_above.assert_called_once()
+        self.assertEqual(parent.tool_progress_callback.call_count, 2)
 
     def test_progress_callback_task_progress_not_misrendered(self):
         """'subagent_progress' (legacy name for TASK_PROGRESS) carries a

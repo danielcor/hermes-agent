@@ -1551,6 +1551,47 @@ def test_drain_notifications_completion_callback_exception_fails_closed(registry
     assert registry.completion_queue.empty()
 
 
+def test_async_delegation_format_includes_named_route_identity():
+    from tools.process_registry import _format_async_delegation
+
+    text = _format_async_delegation({
+        "delegation_id": "deleg-route",
+        "goal": "review",
+        "role": "leaf",
+        "lane": "review",
+        "provider": "xai-oauth",
+        "model": "grok-4.5",
+        "status": "completed",
+        "summary": "clean",
+        "duration_seconds": 1,
+    })
+
+    assert "Lane: review" in text
+    assert "Provider: xai-oauth" in text
+    assert "Model: grok-4.5" in text
+
+
+def test_async_batch_format_includes_named_route_identity():
+    from tools.process_registry import _format_async_delegation
+
+    text = _format_async_delegation({
+        "delegation_id": "deleg-route",
+        "is_batch": True,
+        "goals": ["review"],
+        "results": [{"task_index": 0, "status": "completed", "summary": "clean"}],
+        "role": "leaf",
+        "lane": "review",
+        "provider": "xai-oauth",
+        "model": "grok-4.5",
+        "status": "completed",
+        "total_duration_seconds": 1,
+    })
+
+    assert "Lane: review" in text
+    assert "Provider: xai-oauth" in text
+    assert "Model: grok-4.5" in text
+
+
 def test_drain_notifications_filters_async_delegation_by_session_key():
     """Async-delegation events should only be consumed by the matching session's drain.
 

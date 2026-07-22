@@ -356,6 +356,9 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
+    frozen_http_policy: Optional[Dict[str, Any]] = None,
+    frozen_bedrock_credentials=None,
+    frozen_bedrock_guardrail: Optional[Dict[str, Any]] = None,
 ):
     """
     Initialize the AI Agent.
@@ -793,6 +796,21 @@ def init_agent(
     agent._anthropic_client = None
     agent._is_anthropic_oauth = False
 
+    # Named delegation routes freeze request policy before child construction.
+    # Initialize the marker for every API mode (including native Anthropic and
+    # Bedrock) so reactive credential refreshes cannot treat those children as
+    # ordinary mutable sessions.
+    if frozen_http_policy is not None:
+        agent._frozen_http_policy = dict(frozen_http_policy)
+        frozen_headers = frozen_http_policy.get("default_headers")
+        if isinstance(frozen_headers, dict):
+            agent._frozen_http_policy["default_headers"] = dict(frozen_headers)
+        agent._frozen_http_base_url = str(base_url or "").rstrip("/")
+    else:
+        agent._frozen_http_policy = None
+        agent._frozen_http_base_url = None
+    agent._frozen_bedrock_credentials = frozen_bedrock_credentials
+
     # Resolve per-provider / per-model request timeout once up front so
     # every client construction path below (Anthropic native, OpenAI-wire,
     # router-based implicit auth) can apply it consistently.  Bedrock
@@ -809,7 +827,10 @@ def init_agent(
             _region_match = re.search(r"bedrock-runtime\.([a-z0-9-]+)\.", base_url or "")
             _br_region = _region_match.group(1) if _region_match else "us-east-1"
             agent._bedrock_region = _br_region
-            agent._anthropic_client = build_anthropic_bedrock_client(_br_region)
+            agent._anthropic_client = build_anthropic_bedrock_client(
+                _br_region,
+                credential_snapshot=agent._frozen_bedrock_credentials,
+            )
             agent._anthropic_api_key = "aws-sdk"
             agent._anthropic_base_url = base_url
             agent._is_anthropic_oauth = False
@@ -837,7 +858,12 @@ def init_agent(
             # The cached refresh path is a no-op when the token still has
             # ``MINIMAX_OAUTH_REFRESH_SKEW_SECONDS`` of life left, so steady-
             # state cost is one file read + one timestamp compare per request.
-            if agent.provider == "minimax-oauth" and isinstance(effective_key, str) and effective_key:
+            if (
+                agent._frozen_http_policy is None
+                and agent.provider == "minimax-oauth"
+                and isinstance(effective_key, str)
+                and effective_key
+            ):
                 try:
                     from hermes_cli.auth import build_minimax_oauth_token_provider
                     effective_key = build_minimax_oauth_token_provider()
@@ -861,7 +887,14 @@ def init_agent(
             # the third-party identity-injection bug.
             from agent.anthropic_adapter import _is_oauth_token as _is_oat
             agent._is_anthropic_oauth = _is_oat(effective_key) if (_is_native_anthropic and isinstance(effective_key, str)) else False
-            agent._anthropic_client = build_anthropic_client(effective_key, base_url, timeout=_provider_timeout)
+            anthropic_client_kwargs: Dict[str, Any] = {"timeout": _provider_timeout}
+            if agent._frozen_http_policy is not None:
+                anthropic_client_kwargs["frozen_http_policy"] = (
+                    agent._frozen_http_policy
+                )
+            agent._anthropic_client = build_anthropic_client(
+                effective_key, base_url, **anthropic_client_kwargs
+            )
             # No OpenAI client needed for Anthropic mode
             agent.client = None
             agent._client_kwargs = {}
@@ -932,22 +965,25 @@ def init_agent(
         # Region is extracted from the base_url or defaults to us-east-1.
         _region_match = re.search(r"bedrock-runtime\.([a-z0-9-]+)\.", base_url or "")
         agent._bedrock_region = _region_match.group(1) if _region_match else "us-east-1"
-        # Guardrail config — read from config.yaml at init time.
-        agent._bedrock_guardrail_config = None
-        try:
-            from hermes_cli.config import load_config as _load_br_cfg
-            _gr = _load_br_cfg().get("bedrock", {}).get("guardrail", {})
-            if _gr.get("guardrail_identifier") and _gr.get("guardrail_version"):
-                agent._bedrock_guardrail_config = {
-                    "guardrailIdentifier": _gr["guardrail_identifier"],
-                    "guardrailVersion": _gr["guardrail_version"],
-                }
-                if _gr.get("stream_processing_mode"):
-                    agent._bedrock_guardrail_config["streamProcessingMode"] = _gr["stream_processing_mode"]
-                if _gr.get("trace"):
-                    agent._bedrock_guardrail_config["trace"] = _gr["trace"]
-        except Exception:
-            pass
+        if frozen_bedrock_guardrail is not None:
+            agent._bedrock_guardrail_config = dict(frozen_bedrock_guardrail) or None
+        else:
+            # Omitted-lane callers retain historical ambient guardrail lookup.
+            agent._bedrock_guardrail_config = None
+            try:
+                from hermes_cli.config import load_config as _load_br_cfg
+                _gr = _load_br_cfg().get("bedrock", {}).get("guardrail", {})
+                if _gr.get("guardrail_identifier") and _gr.get("guardrail_version"):
+                    agent._bedrock_guardrail_config = {
+                        "guardrailIdentifier": _gr["guardrail_identifier"],
+                        "guardrailVersion": _gr["guardrail_version"],
+                    }
+                    if _gr.get("stream_processing_mode"):
+                        agent._bedrock_guardrail_config["streamProcessingMode"] = _gr["stream_processing_mode"]
+                    if _gr.get("trace"):
+                        agent._bedrock_guardrail_config["trace"] = _gr["trace"]
+            except Exception:
+                pass
         agent.client = None
         agent._client_kwargs = {}
         if not agent.quiet_mode:
@@ -1106,6 +1142,10 @@ def init_agent(
                     )
         
         agent._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
+        if agent._frozen_http_policy is not None:
+            agent._frozen_http_base_url = str(
+                agent._client_kwargs.get("base_url") or ""
+            ).rstrip("/")
 
         # Enable fine-grained tool streaming for Claude on OpenRouter.
         # Without this, Anthropic buffers the entire tool call and goes
@@ -1131,35 +1171,62 @@ def init_agent(
         # OpenAI SDK's identifying headers swap in a plain User-Agent. (#40033)
         # client_kwargs is the same dict object as agent._client_kwargs, so
         # this mutation is reflected in the client built just below.
-        agent._apply_user_default_headers()
+        if frozen_http_policy is not None:
+            # Named delegation routes resolve config-derived HTTP policy once
+            # before child construction. An empty mapping is meaningful: it
+            # closes the route against later model/custom-provider config.
+            frozen_headers = frozen_http_policy.get("default_headers")
+            if isinstance(frozen_headers, dict) and frozen_headers:
+                merged_headers = dict(client_kwargs.get("default_headers") or {})
+                merged_headers.update(frozen_headers)
+                client_kwargs["default_headers"] = merged_headers
+            for policy_key in ("ssl_ca_cert", "ssl_verify"):
+                if policy_key in frozen_http_policy:
+                    client_kwargs[policy_key] = frozen_http_policy[policy_key]
+        else:
+            agent._apply_user_default_headers()
 
-        try:
-            from hermes_cli.config import (
-                apply_custom_provider_extra_headers_to_client_kwargs,
-                apply_custom_provider_tls_to_client_kwargs,
-                get_compatible_custom_providers,
-                load_config,
-            )
+            try:
+                from hermes_cli.config import (
+                    apply_custom_provider_extra_headers_to_client_kwargs,
+                    apply_custom_provider_tls_to_client_kwargs,
+                    get_compatible_custom_providers,
+                    load_config,
+                )
 
-            _cp_config = load_config()
-            _cp_entries = get_compatible_custom_providers(_cp_config)
-            _cp_base_url = str(client_kwargs.get("base_url") or agent.base_url or "")
-            apply_custom_provider_tls_to_client_kwargs(
-                client_kwargs,
-                _cp_base_url,
-                _cp_entries,
-            )
-            # Per-provider extra HTTP headers (providers.<name>.extra_headers /
-            # custom_providers[].extra_headers) — proxies, gateways, custom
-            # auth. Applied last so the most specific config level wins.
-            # SECURITY: values may carry credentials — never log them.
-            apply_custom_provider_extra_headers_to_client_kwargs(
-                client_kwargs,
-                _cp_base_url,
-                _cp_entries,
-            )
-        except Exception:
-            logger.debug("custom-provider TLS resolution skipped", exc_info=True)
+                _cp_config = load_config()
+                _cp_entries = get_compatible_custom_providers(_cp_config)
+                _cp_base_url = str(client_kwargs.get("base_url") or agent.base_url or "")
+                apply_custom_provider_tls_to_client_kwargs(
+                    client_kwargs,
+                    _cp_base_url,
+                    _cp_entries,
+                )
+                # Per-provider extra HTTP headers
+                # (providers.<name>.extra_headers / custom_providers[].extra_headers)
+                # are applied last so the most specific config level wins.
+                # SECURITY: values may carry credentials — never log them.
+                apply_custom_provider_extra_headers_to_client_kwargs(
+                    client_kwargs,
+                    _cp_base_url,
+                    _cp_entries,
+                )
+            except Exception:
+                logger.debug("custom-provider TLS resolution skipped", exc_info=True)
+
+        if frozen_http_policy is not None:
+            # Capture the complete effective client policy, including static
+            # provider headers added above, so later rebuilds never consult
+            # mutable provider profiles or user configuration.
+            effective_policy = {
+                key: agent._client_kwargs[key]
+                for key in ("ssl_ca_cert", "ssl_verify")
+                if key in agent._client_kwargs
+            }
+            effective_headers = agent._client_kwargs.get("default_headers")
+            if isinstance(effective_headers, dict) and effective_headers:
+                effective_policy["default_headers"] = dict(effective_headers)
+            agent._frozen_http_policy = effective_policy
 
         agent.api_key = client_kwargs.get("api_key", "")
         agent.base_url = client_kwargs.get("base_url", agent.base_url)

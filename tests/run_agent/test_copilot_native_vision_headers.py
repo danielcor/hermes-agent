@@ -20,6 +20,13 @@ def _make_copilot_agent():
 
 def test_request_client_adds_copilot_vision_header_for_native_image_payload():
     agent = _make_copilot_agent()
+    getattr(agent, "_client_kwargs")["default_headers"].update(
+        {
+            "X-Lane-Auth": "frozen-auth",
+            "X-Lane-Route": "review",
+            "User-Agent": "frozen-route-agent",
+        }
+    )
     built_kwargs = []
 
     def fake_create(kwargs, *, reason, shared):
@@ -47,6 +54,9 @@ def test_request_client_adds_copilot_vision_header_for_native_image_payload():
 
     headers = built_kwargs[-1]["default_headers"]
     assert headers["Copilot-Vision-Request"] == "true"
+    assert headers["X-Lane-Auth"] == "frozen-auth"
+    assert headers["X-Lane-Route"] == "review"
+    assert headers["User-Agent"] == "frozen-route-agent"
 
 
 def test_request_client_leaves_copilot_text_requests_without_vision_header():

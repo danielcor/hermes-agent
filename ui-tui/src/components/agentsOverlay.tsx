@@ -344,6 +344,8 @@ function Detail({ id, node, t }: { id?: string; node: SubagentNode; t: Theme }) 
 
       <Box flexDirection="column" marginTop={1}>
         <Field name="depth" t={t} value={`${item.depth} · ${item.status}`} />
+        {item.lane ? <Field name="lane" t={t} value={item.lane} /> : null}
+        {item.provider ? <Field name="provider" t={t} value={item.provider} /> : null}
         {item.model ? <Field name="model" t={t} value={item.model} /> : null}
         {item.toolsets?.length ? <Field name="toolsets" t={t} value={item.toolsets.join(', ')} /> : null}
         <Field name="tools" t={t} value={`${item.toolCount ?? 0} (subtree ${agg.totalTools})`} />
@@ -458,7 +460,8 @@ function ListRow({
   const heatIdx = hotnessBucket(node.aggregate.hotness, peak, palette.length)
   const heatMarker = heatIdx >= 2 ? palette[heatIdx]! : null
 
-  const goal = compactPreview(node.item.goal || 'subagent', width - 28 - node.item.depth * 2)
+  const route = node.item.lane ? `[${node.item.lane}] ` : ''
+  const goal = compactPreview(`${route}${node.item.goal || 'subagent'}`, width - 28 - node.item.depth * 2)
   const toolsCount = node.aggregate.totalTools > 0 ? ` ·${node.aggregate.totalTools}t` : ''
   const kids = node.children.length ? ` ·${node.children.length}↓` : ''
   const line = node.item.status === 'running' ? node.item.tools.at(-1) : undefined

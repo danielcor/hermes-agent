@@ -1123,6 +1123,17 @@ delegation:
   # provider: "openrouter"                    # Override provider for subagents (empty = inherit parent)
   #                                           # Resolves full credentials (base_url, api_key) automatically.
   #                                           # Supported: openrouter, nous, zai, kimi-coding, minimax
+  # lanes:                                    # Trusted routes selectable by delegate_task(lane="...").
+  #   review:                                 # Names are exact and case-sensitive.
+  #     provider: xai-oauth                   # Credentials resolve locally; never put secrets in a lane.
+  #     model: grok-4.5
+  #     reasoning_effort: high
+  #   apply:
+  #     provider: openai-codex
+  #     model: gpt-5.6-sol
+  #     reasoning_effort: high
+  #   paused:
+  #     enabled: false                        # Missing enabled defaults to true.
 
 # =============================================================================
 # Honcho Integration (Cross-Session User Modeling)

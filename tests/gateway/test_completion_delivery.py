@@ -157,6 +157,68 @@ def test_concurrent_claims_share_the_same_narrow_delivery_seam():
     adapter.handle_message.assert_awaited_once()
 
 
+def test_gateway_renews_durable_claim_while_adapter_delivery_is_pending(monkeypatch):
+    from tools import async_delegation
+    import gateway.run as gateway_run
+
+    renewals = []
+    monkeypatch.setattr(async_delegation, "claim_completion_delivery", lambda *_: True)
+    monkeypatch.setattr(
+        async_delegation,
+        "renew_completion_delivery",
+        lambda delegation_id, claim_id: renewals.append((delegation_id, claim_id)) or True,
+        raising=False,
+    )
+    monkeypatch.setattr(async_delegation, "complete_completion_delivery", lambda *_: True)
+    monkeypatch.setattr(gateway_run, "_COMPLETION_CLAIM_HEARTBEAT_SECONDS", 0.001)
+
+    async def _slow_injection(_event):
+        await asyncio.sleep(0.01)
+
+    runner = _runner(SimpleNamespace(handle_message=AsyncMock(side_effect=_slow_injection)))
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("completion", _async_event())
+    ) is True
+    assert renewals
+
+
+def test_gateway_competing_pending_claim_is_retryable(monkeypatch):
+    from tools import async_delegation
+
+    monkeypatch.setattr(async_delegation, "claim_completion_delivery", lambda *_: False)
+    monkeypatch.setattr(async_delegation, "event_delivery_is_pending", lambda _evt: True)
+    runner = _runner(SimpleNamespace(handle_message=AsyncMock()))
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("completion", _async_event("deleg-held"))
+    ) is False
+
+
+def test_failed_fenced_ack_is_retryable_and_not_cached_as_delivered(monkeypatch):
+    from tools import async_delegation
+
+    releases = []
+    monkeypatch.setattr(async_delegation, "claim_completion_delivery", lambda *_: True)
+    monkeypatch.setattr(async_delegation, "complete_completion_delivery", lambda *_: False)
+    monkeypatch.setattr(
+        async_delegation,
+        "release_completion_delivery",
+        lambda delegation_id, claim_id: releases.append((delegation_id, claim_id)) or True,
+    )
+    runner = _runner(SimpleNamespace(handle_message=AsyncMock()))
+    event = _async_event("deleg_fenced_ack")
+    identity = runner._completion_delivery_identity(event)
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("completion", event)
+    ) is False
+    assert identity not in runner._completion_deliveries_delivered
+    assert identity not in runner._completion_deliveries_inflight
+    assert len(releases) == 1
+    assert releases[0][0] == "deleg_fenced_ack"
+
+
 def test_failed_async_injection_is_retried_and_only_success_is_acked(
     monkeypatch, isolated_registry,
 ):

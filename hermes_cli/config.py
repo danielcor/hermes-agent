@@ -2372,6 +2372,10 @@ DEFAULT_CONFIG = {
                                      # (floor 30s) to enforce a hard cap.
         "reasoning_effort": "",  # subagent effort: "ultra", "max", "xhigh", "high",
                                  # "medium", "low", "minimal", "none" (empty = inherit)
+        # Trusted symbolic routes selectable with delegate_task(lane="...").
+        # Each lane may override enabled/provider/model/reasoning_effort only;
+        # execution limits above remain global for predictable batching.
+        "lanes": {},
         "max_concurrent_children": 3,  # unified concurrency cap: max parallel children per batch
                                        # AND max concurrent background (background=true)
                                        # delegation units. New async dispatches beyond the cap
@@ -5609,6 +5613,66 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
 
     issues: List[ConfigIssue] = []
 
+    # ── delegation.lanes: trusted named route overlays ─────────────────
+    delegation = config.get("delegation")
+    if "delegation" in config and not isinstance(delegation, dict):
+        issues.append(ConfigIssue(
+            "error",
+            f"delegation should be a dict, got {type(delegation).__name__}",
+            "Use: delegation:\n  lanes:\n    review:\n      model: ...",
+        ))
+    elif isinstance(delegation, dict) and "lanes" in delegation:
+        lanes = delegation.get("lanes")
+        allowed_lane_fields = {"enabled", "provider", "model", "reasoning_effort"}
+        if not isinstance(lanes, dict):
+            issues.append(ConfigIssue(
+                "error",
+                f"delegation.lanes should be a dict, got {type(lanes).__name__}",
+                "Use: delegation:\n  lanes:\n    review:\n      model: ...",
+            ))
+        else:
+            from hermes_constants import parse_reasoning_effort
+
+            for lane_name, lane_cfg in lanes.items():
+                if not isinstance(lane_name, str) or not lane_name.strip():
+                    issues.append(ConfigIssue(
+                        "error",
+                        f"delegation lane name must be a non-empty string, got {lane_name!r}",
+                        "Use a symbolic name such as review or apply",
+                    ))
+                    continue
+                if lane_name != lane_name.strip():
+                    issues.append(ConfigIssue(
+                        "error",
+                        f"delegation lane name must not have surrounding whitespace: {lane_name!r}",
+                        f"Rename it to {lane_name.strip()!r}",
+                    ))
+                path = f"delegation.lanes.{lane_name}"
+                if not isinstance(lane_cfg, dict):
+                    issues.append(ConfigIssue(
+                        "error", f"{path} should be a dict", "Each lane must contain named route fields",
+                    ))
+                    continue
+                unknown = set(lane_cfg) - allowed_lane_fields
+                if unknown:
+                    unknown_types = sorted({type(field).__name__ for field in unknown})
+                    issues.append(ConfigIssue(
+                        "error",
+                        f"{path} has {len(unknown)} unknown field(s) of type(s) {unknown_types}",
+                        f"Allowed fields: {sorted(allowed_lane_fields)}",
+                    ))
+                if "enabled" in lane_cfg and not isinstance(lane_cfg["enabled"], bool):
+                    issues.append(ConfigIssue("error", f"{path}.enabled must be a boolean", "Use true or false"))
+                for field in ("provider", "model", "reasoning_effort"):
+                    if field in lane_cfg and not isinstance(lane_cfg[field], str):
+                        issues.append(ConfigIssue("error", f"{path}.{field} must be a string", "Use a quoted string value"))
+                effort = lane_cfg.get("reasoning_effort")
+                if isinstance(effort, str) and effort and parse_reasoning_effort(effort) is None:
+                    issues.append(ConfigIssue(
+                        "error", f"{path}.reasoning_effort is invalid",
+                        "Use ultra, max, xhigh, high, medium, low, minimal, none, or an empty string",
+                    ))
+
     # ── custom_providers must be a list, not a dict ──────────────────────
     cp = config.get("custom_providers")
     if cp is not None:
@@ -8550,8 +8614,17 @@ def _default_value_for_key(dotted_key: str):
     Unknown keys and non-leaf paths return ``None`` so they retain the legacy
     best-effort coercion used by ``config set``.
     """
+    segments = dotted_key.split(".")
+    if len(segments) == 4 and segments[:2] == ["delegation", "lanes"]:
+        return {
+            "enabled": True,
+            "provider": "",
+            "model": "",
+            "reasoning_effort": "",
+        }.get(segments[3])
+
     node = DEFAULT_CONFIG
-    for part in dotted_key.split("."):
+    for part in segments:
         if not isinstance(node, dict) or part not in node:
             return None
         node = node[part]
@@ -8659,6 +8732,22 @@ def _validate_config_key(key: str) -> tuple[bool, Optional[str]]:
 
     segments = key.split(".")
     top = segments[0]
+
+    if segments[:2] == ["delegation", "lanes"] and len(segments) < 3:
+        # ``lanes`` is a structural mapping. Scalar writes here would destroy
+        # every configured lane and only fail later when delegation loads it.
+        return False, None
+
+    if len(segments) >= 3 and segments[:2] == ["delegation", "lanes"]:
+        lane_name = segments[2]
+        if not lane_name or lane_name != lane_name.strip():
+            return False, None
+        if len(segments) == 3:
+            # The lane name is a structural container, never a scalar leaf.
+            # Users create/update it through one of the typed fields below.
+            return False, None
+        allowed = {"enabled", "provider", "model", "reasoning_effort"}
+        return (segments[3] in allowed and len(segments) == 4), None
 
     # ── Underscore-prefixed keys are internal/test markers ───────────
     # A leading underscore on the top-level segment (e.g. ``_test.shim_marker``)
@@ -8779,6 +8868,14 @@ def set_config_value(key: str, value: str, force: bool = False):
     # Warn after the write so the user gets immediate feedback plus a
     # "did you mean" hint, without blocking legitimate unknown keys.
     is_known, suggestion = _validate_config_key(key)
+    if (
+        key == "delegation.lanes" or key.startswith("delegation.lanes.")
+    ) and not is_known:
+        raise ValueError(
+            f"Invalid delegation lane config key: {key!r}. Expected "
+            "delegation.lanes.<non-empty-name>."
+            "{enabled,provider,model,reasoning_effort}."
+        )
 
     # Otherwise it goes to config.yaml
     # Read the raw user config (not merged with defaults) to avoid
@@ -8814,6 +8911,15 @@ def set_config_value(key: str, value: str, force: bool = False):
 
     value = coerced_value
     _set_nested(user_config, key, value)
+    if key == "delegation.lanes" or key.startswith("delegation.lanes."):
+        lane_issues = [
+            issue
+            for issue in validate_config_structure(user_config)
+            if issue.severity == "error" and issue.message.startswith("delegation")
+        ]
+        if lane_issues:
+            issue = lane_issues[0]
+            raise ValueError(f"Invalid delegation lane config: {issue.message}. {issue.hint}")
     # Normalize the api_base → base_url alias at set-time too (issue #8919),
     # so a fresh `hermes config set model.api_base ...` lands on the canonical
     # key the runtime resolver actually reads, instead of being silently
@@ -8977,7 +9083,11 @@ def config_command(args):
             print()
             print("  --force: skip the unknown-key notice for unrecognized keys")
             sys.exit(1)
-        set_config_value(key, value, force=force)
+        try:
+            set_config_value(key, value, force=force)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
 
     elif subcmd == "unset":
         key = getattr(args, 'key', None)

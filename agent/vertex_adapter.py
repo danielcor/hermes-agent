@@ -108,7 +108,10 @@ def _refresh_credentials(creds) -> None:
     creds.refresh(auth_req)
 
 
-def get_vertex_credentials(credentials_path: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+def get_vertex_credentials(
+    credentials_path: Optional[str] = None,
+    project_id_override: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str]]:
     """Return a (fresh access_token, project_id) pair or (None, None) on failure.
 
     Caches the underlying Credentials object and refreshes it when within
@@ -167,7 +170,11 @@ def get_vertex_credentials(credentials_path: Optional[str] = None) -> Tuple[Opti
         if needs_refresh:
             _refresh_credentials(creds)
 
-        override_project = _resolve_project_override()
+        override_project = (
+            _resolve_project_override()
+            if project_id_override is None
+            else project_id_override.strip()
+        )
         if override_project:
             project_id = override_project
 
@@ -182,7 +189,7 @@ def get_vertex_credentials(credentials_path: Optional[str] = None) -> Tuple[Opti
             sa_path = _resolve_credentials_path(credentials_path)
             if sa_path:
                 logger.info("ADC failed, retrying with service account: %s", sa_path)
-                return get_vertex_credentials(sa_path)
+                return get_vertex_credentials(sa_path, project_id_override)
 
         return None, None
 
@@ -202,14 +209,18 @@ def build_vertex_base_url(project_id: str, region: str = DEFAULT_REGION) -> str:
 def get_vertex_config(
     credentials_path: Optional[str] = None,
     region: Optional[str] = None,
+    project_id: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     """Resolve (access_token, base_url) for Vertex AI, or (None, None) on failure."""
-    token, project_id = get_vertex_credentials(credentials_path)
-    if not token or not project_id:
+    token, resolved_project_id = get_vertex_credentials(
+        credentials_path,
+        project_id_override=project_id,
+    )
+    if not token or not resolved_project_id:
         return None, None
 
     effective_region = _resolve_region(region)
-    base_url = build_vertex_base_url(project_id, effective_region)
+    base_url = build_vertex_base_url(resolved_project_id, effective_region)
     return token, base_url
 
 

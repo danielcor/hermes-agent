@@ -18,12 +18,37 @@ describe('subagent store', () => {
 
   it('upserts subagent progress and keeps terminal status stable', () => {
     upsertSubagent('s1', { goal: 'scan files', status: 'running', subagent_id: 'a1', task_index: 0 })
-    upsertSubagent('s1', { goal: 'scan files', status: 'completed', subagent_id: 'a1', summary: 'done', task_index: 0 })
+    upsertSubagent('s1', {
+      exit_reason: 'max_iterations',
+      goal: 'scan files',
+      status: 'completed',
+      subagent_id: 'a1',
+      summary: 'done',
+      task_index: 0
+    })
     upsertSubagent('s1', { goal: 'scan files', status: 'running', subagent_id: 'a1', task_index: 0, text: 'late' })
 
     const item = listFor('s1')[0]
     expect(item?.status).toBe('completed')
+    expect(item?.exitReason).toBe('max_iterations')
     expect(item?.summary).toBe('done')
+  })
+
+  it('preserves the resolved delegation lane route', () => {
+    upsertSubagent('s1', {
+      goal: 'review',
+      lane: 'review',
+      model: 'grok-4.5',
+      provider: 'xai-oauth',
+      status: 'running',
+      subagent_id: 'a1',
+      task_index: 0
+    })
+
+    const item = listFor('s1')[0]
+    expect(item?.lane).toBe('review')
+    expect(item?.provider).toBe('xai-oauth')
+    expect(item?.model).toBe('grok-4.5')
   })
 
   it('builds parent/child trees', () => {

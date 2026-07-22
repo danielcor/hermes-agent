@@ -24,7 +24,7 @@ import { Panel, PanelEmpty, PanelHeader } from '../overlays/panel'
 
 // Mirrors statusGlyph() in tool-fallback.tsx so subagent rows speak the
 // same visual vocabulary as the chat tool blocks.
-function statusGlyph(status: SubagentStatus, a: Translations['agents']): ReactNode {
+function statusGlyph(status: SubagentStatus, exitReason: string | undefined, a: Translations['agents']): ReactNode {
   if (status === 'running' || status === 'queued') {
     return (
       <GlyphSpinner
@@ -37,6 +37,10 @@ function statusGlyph(status: SubagentStatus, a: Translations['agents']): ReactNo
 
   if (status === 'failed' || status === 'interrupted') {
     return <AlertCircle aria-label={a.failed} className="size-3.5 shrink-0 text-destructive" />
+  }
+
+  if (status === 'completed' && exitReason && exitReason !== 'completed') {
+    return <AlertCircle aria-label={exitReason} className="size-3.5 shrink-0 text-amber-500" />
   }
 
   return <CheckCircle2 aria-label={a.done} className="size-3.5 shrink-0 text-emerald-600/85 dark:text-emerald-400/85" />
@@ -312,7 +316,9 @@ function SubagentRow({ node, depth = 0, nowMs }: { node: SubagentNode; depth?: n
   const fileLines = [...node.filesWritten.map(p => `+ ${p}`), ...node.filesRead.map(p => `· ${p}`)]
 
   const subtitle = [
-    node.model,
+    node.exitReason && node.exitReason !== 'completed' ? node.exitReason.replaceAll('_', ' ') : '',
+    node.lane,
+    [node.provider, node.model].filter(Boolean).join('/'),
     fmtDuration(durationSeconds, t.agents),
     node.toolCount ? t.agents.toolsCount(node.toolCount) : '',
     fmtTokens((node.inputTokens ?? 0) + (node.outputTokens ?? 0), t.agents),
@@ -327,7 +333,9 @@ function SubagentRow({ node, depth = 0, nowMs }: { node: SubagentNode; depth?: n
         onClick={() => setOpen(v => !v)}
         type="button"
       >
-        <span className="mt-0.5 flex h-[1.1rem] shrink-0 items-center">{statusGlyph(node.status, t.agents)}</span>
+        <span className="mt-0.5 flex h-[1.1rem] shrink-0 items-center">
+          {statusGlyph(node.status, node.exitReason, t.agents)}
+        </span>
         <span className="flex min-w-0 flex-1 flex-col gap-0.5">
           <span
             className={cn(

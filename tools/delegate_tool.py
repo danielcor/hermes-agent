@@ -17,9 +17,12 @@ The parent's context only sees the delegation call and the summary result,
 never the child's intermediate tool calls or reasoning.
 """
 
+import copy
 import enum
 import json
 import logging
+from dataclasses import dataclass, field
+from types import MappingProxyType
 
 logger = logging.getLogger(__name__)
 import os
@@ -29,8 +32,9 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
 )
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
+from agent.redact import redact_sensitive_text
 from toolsets import TOOLSETS
 
 # Sentinel value used by the runtime provider system for providers that are
@@ -40,6 +44,248 @@ _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
+
+
+def _freeze_route_value(value: Any) -> Any:
+    """Recursively freeze mutable route data without retaining source aliases."""
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _freeze_route_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_route_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_route_value(item) for item in value)
+    return copy.deepcopy(value)
+
+
+def _thaw_route_value(value: Any) -> Any:
+    """Return a mutable per-child copy of recursively frozen route data."""
+    if isinstance(value, Mapping):
+        return {key: _thaw_route_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_route_value(item) for item in value]
+    if isinstance(value, frozenset):
+        return {_thaw_route_value(item) for item in value}
+    return copy.deepcopy(value)
+
+
+def _safe_delegation_exception(exc: BaseException, operation: str) -> str:
+    """Describe a delegation failure without rendering attacker-controlled text."""
+    return f"{type(exc).__name__}: {operation}"
+
+
+@dataclass(frozen=True)
+class DelegationRoute:
+    """Immutable provider/model/reasoning snapshot for one delegation call."""
+
+    lane: Optional[str]
+    model: Optional[str]
+    provider: Optional[str]
+    base_url: Optional[str] = field(repr=False)
+    api_key: Any = field(repr=False)
+    api_mode: Optional[str] = field(repr=False)
+    request_overrides: Optional[Mapping[str, Any]] = field(repr=False)
+    provider_routing: Optional[Mapping[str, Any]] = field(repr=False)
+    http_policy: Optional[Mapping[str, Any]] = field(repr=False)
+    max_output_tokens: Optional[int] = field(repr=False)
+    command: Optional[str] = field(repr=False)
+    args: Optional[Tuple[str, ...]] = field(repr=False)
+    reasoning_config: Optional[Mapping[str, Any]] = field(repr=False)
+    resolved_model: Optional[str] = field(repr=False)
+    resolved_provider: Optional[str] = field(repr=False)
+    bedrock_credentials: Any = field(default=None, repr=False)
+    bedrock_guardrail: Optional[Mapping[str, Any]] = field(default=None, repr=False)
+
+
+class _RecordingCredentialProvider:
+    """Callable-compatible credential source that remembers transport values."""
+
+    def __init__(self, provider: Callable[[], Any]):
+        self._provider = provider
+        self._observed_values: set[str] = set()
+        self._lock = threading.Lock()
+
+    def __call__(self) -> Any:
+        value = self._provider()
+        if isinstance(value, str) and value:
+            with self._lock:
+                self._observed_values.add(value)
+        return value
+
+    def publication_secrets(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(self._observed_values)
+
+
+def _route_publication_sanitizer(route: DelegationRoute):
+    """Build a recursive redactor for untrusted child progress/output events."""
+    hidden_values: set[str] = set()
+    dynamic_secret_sources: list[Callable[[], Any]] = []
+    stream_pending = ""
+
+    # Reasoning settings are policy, not credentials. Their small enum values
+    # occur constantly in normal prose ("high confidence", "low latency").
+    # Treating those words as substring secrets corrupts otherwise harmless
+    # child output. Explicit transport/credential values remain fully redacted,
+    # including short ACP arguments covered by the streaming tests below.
+    benign_policy_values = {
+        "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"
+    }
+
+    def _collect(value: Any, *, allow_benign_policy_value: bool = False) -> None:
+        publication_secrets = getattr(value, "publication_secrets", None)
+        if callable(publication_secrets):
+            dynamic_secret_sources.append(publication_secrets)
+            secrets = publication_secrets()
+            if isinstance(secrets, (list, tuple, set, frozenset)):
+                for secret in secrets:
+                    _collect(secret)
+            return
+        if isinstance(value, str):
+            if value and not (
+                allow_benign_policy_value
+                and value.strip().casefold() in benign_policy_values
+            ):
+                hidden_values.add(value)
+            return
+        if isinstance(value, (bytes, bytearray)):
+            decoded = bytes(value).decode("utf-8", errors="replace")
+            if decoded:
+                hidden_values.add(decoded)
+            return
+        if isinstance(value, Mapping):
+            # Most mapping keys describe shape ("headers", "effort", etc.),
+            # but untrusted override maps can also carry secret material as a
+            # key. Collect only high-signal keys so ordinary schema words do
+            # not corrupt child prose or collapse into duplicate redacted keys.
+            for key, item in value.items():
+                if isinstance(key, str) and len(key) >= 8:
+                    hidden_values.add(key)
+                elif isinstance(key, (bytes, bytearray)):
+                    _collect(key)
+                _collect(item, allow_benign_policy_value=allow_benign_policy_value)
+            return
+        if isinstance(value, (list, tuple, set, frozenset)):
+            for item in value:
+                _collect(item, allow_benign_policy_value=allow_benign_policy_value)
+
+    # lane/provider/model are intentionally public identity. Every other route
+    # field is internal and must not be echoed through progress or transcripts.
+    for hidden in (
+        route.base_url,
+        route.api_key,
+        route.api_mode,
+        route.request_overrides,
+        route.provider_routing,
+        route.http_policy,
+        route.bedrock_credentials,
+        route.bedrock_guardrail,
+        route.command,
+        route.args,
+    ):
+        _collect(hidden)
+    _collect(route.reasoning_config, allow_benign_policy_value=True)
+    def _ordered_hidden() -> tuple[str, ...]:
+        for source in dynamic_secret_sources:
+            try:
+                secrets = source()
+                if isinstance(secrets, (list, tuple, set, frozenset)):
+                    for secret in secrets:
+                        _collect(secret)
+            except Exception:
+                logger.debug("Could not read recorded route credentials", exc_info=True)
+        return tuple(sorted(hidden_values, key=len, reverse=True))
+
+    def _sanitize_text(value: str) -> str:
+        cleaned = redact_sensitive_text(value)
+        for hidden in _ordered_hidden():
+            cleaned = cleaned.replace(hidden, "[REDACTED ROUTE VALUE]")
+        return cleaned
+
+    def _sanitize_stream_delta(value: str) -> str:
+        """Redact complete values and retain only an unmatched secret prefix.
+
+        Scanning from left to right avoids the self-overlap flaw in a plain
+        suffix heuristic: once ``AA`` is matched, neither character is later
+        re-published as the pending ``A`` prefix.
+        """
+        nonlocal stream_pending
+        combined = stream_pending + value
+        stream_pending = ""
+        ordered_hidden = _ordered_hidden()
+        output: list[str] = []
+        index = 0
+        while index < len(combined):
+            matched = next(
+                (
+                    hidden
+                    for hidden in ordered_hidden
+                    if combined.startswith(hidden, index)
+                ),
+                None,
+            )
+            if matched is not None:
+                output.append("[REDACTED ROUTE VALUE]")
+                index += len(matched)
+                continue
+
+            remainder = combined[index:]
+            if any(hidden.startswith(remainder) for hidden in ordered_hidden):
+                stream_pending = remainder
+                break
+
+            output.append(combined[index])
+            index += 1
+        return redact_sensitive_text("".join(output))
+
+    def _sanitize_recursive(value: Any) -> Any:
+        if isinstance(value, str):
+            return _sanitize_text(value)
+        if isinstance(value, bytes):
+            return _sanitize_text(value.decode("utf-8", errors="replace")).encode("utf-8")
+        if isinstance(value, bytearray):
+            return bytearray(
+                _sanitize_text(value.decode("utf-8", errors="replace")).encode("utf-8")
+            )
+        if isinstance(value, Mapping):
+            return {
+                _sanitize_recursive(key): _sanitize_recursive(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [_sanitize_recursive(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(_sanitize_recursive(item) for item in value)
+        if isinstance(value, set):
+            return {_sanitize_recursive(item) for item in value}
+        if isinstance(value, frozenset):
+            return frozenset(_sanitize_recursive(item) for item in value)
+        return value
+
+    def _sanitize(value: Any) -> Any:
+        nonlocal stream_pending
+        if isinstance(value, tuple) and len(value) == 5:
+            event_type, tool_name, preview, args, kwargs = value
+            if event_type == "subagent.text" and isinstance(preview, str):
+                preview = _sanitize_stream_delta(preview)
+            elif event_type in ("subagent.complete", "subagent.stop"):
+                # A retained fragment may itself be a prefix of a route secret;
+                # terminal events cannot safely publish it, so fail closed.
+                stream_pending = ""
+            return (
+                event_type,
+                _sanitize_recursive(tool_name),
+                preview if event_type == "subagent.text" else _sanitize_recursive(preview),
+                _sanitize_recursive(args),
+                _sanitize_recursive(kwargs),
+            )
+        return _sanitize_recursive(value)
+
+    setattr(_sanitize, "_is_delegation_route_sanitizer", True)
+    return _sanitize
 
 
 # Tools that children must never have access to
@@ -832,9 +1078,12 @@ def _build_child_progress_callback(
     subagent_id: Optional[str] = None,
     parent_id: Optional[str] = None,
     depth: Optional[int] = None,
+    lane: Optional[str] = None,
     model: Optional[str] = None,
+    provider: Optional[str] = None,
     toolsets: Optional[List[str]] = None,
     session_ref: Optional[Dict[str, Any]] = None,
+    public_sanitizer=None,
 ) -> Optional[callable]:
     """Build a callback that relays child agent tool calls to the parent display.
 
@@ -842,8 +1091,8 @@ def _build_child_progress_callback(
       CLI:     prints tree-view lines above the parent's delegation spinner
       Gateway: batches tool names and relays to parent's progress callback
 
-    The identity kwargs (``subagent_id``, ``parent_id``, ``depth``, ``model``,
-    ``toolsets``) are threaded into every relayed event so the TUI can
+    The identity kwargs (``subagent_id``, ``parent_id``, ``depth``, ``lane``,
+    ``provider``, ``model``, ``toolsets``) are threaded into every relayed event so the TUI can
     reconstruct the live spawn tree and route per-branch controls (kill,
     pause) back by ``subagent_id``.  All are optional for backward compat —
     older callers that ignore them still produce a flat list on the TUI.
@@ -878,8 +1127,12 @@ def _build_child_progress_callback(
             kw["parent_id"] = parent_id
         if depth is not None:
             kw["depth"] = depth
+        if lane is not None:
+            kw["lane"] = lane
         if model is not None:
             kw["model"] = model
+        if provider is not None:
+            kw["provider"] = provider
         if toolsets is not None:
             kw["toolsets"] = list(toolsets)
         # The child's own session id — filled into the shared ref once the
@@ -900,15 +1153,20 @@ def _build_child_progress_callback(
         try:
             parent_cb(event_type, tool_name, preview, args, **payload)
         except Exception as e:
-            logger.debug("Parent callback failed: %s", e)
+            logger.debug("Parent callback failed (%s)", type(e).__name__)
 
     def _callback(
         event_type, tool_name: str = None, preview: str = None, args=None, **kwargs
     ):
+        already_sanitized = kwargs.pop("_delegation_route_sanitized", False)
+        if public_sanitizer is not None and not already_sanitized:
+            event_type, tool_name, preview, args, kwargs = public_sanitizer(
+                (event_type, tool_name, preview, args, kwargs)
+            )
         # Lifecycle events emitted by the orchestrator itself — handled
         # before enum normalisation since they are not part of DelegateEvent.
-        if event_type == "subagent.start":
-            if spinner and goal_label:
+        if event_type in ("subagent.spawn_requested", "subagent.start"):
+            if event_type == "subagent.start" and spinner and goal_label:
                 short = (
                     (goal_label[:55] + "...") if len(goal_label) > 55 else goal_label
                 )
@@ -916,7 +1174,7 @@ def _build_child_progress_callback(
                     spinner.print_above(f" {prefix}├─ 🔀 {short}")
                 except Exception as e:
                     logger.debug("Spinner print_above failed: %s", e)
-            _relay("subagent.start", preview=preview or goal_label or "", **kwargs)
+            _relay(event_type, preview=preview or goal_label or "", **kwargs)
             return
 
         if event_type == "subagent.complete":
@@ -974,11 +1232,7 @@ def _build_child_progress_callback(
                     spinner.print_above(f" {prefix}├─ 🔀 {summary_text}")
                 except Exception as e:
                     logger.debug("Spinner print_above failed: %s", e)
-            if parent_cb:
-                try:
-                    parent_cb("subagent_progress", f"{prefix}{summary_text}")
-                except Exception as e:
-                    logger.debug("Parent callback relay failed: %s", e)
+            _relay("subagent_progress", f"{prefix}{summary_text}")
             return
 
         # TASK_TOOL_STARTED — display and batch for parent relay
@@ -1022,6 +1276,7 @@ def _build_child_progress_callback(
             _batch.clear()
 
     _callback._flush = _flush
+    setattr(_callback, "_delegate_public_sanitizer", public_sanitizer)
     return _callback
 
 
@@ -1082,6 +1337,13 @@ def _build_child_agent(
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
+    override_reasoning_config: Optional[Mapping[str, Any]] = None,
+    override_provider_routing: Optional[Mapping[str, Any]] = None,
+    override_http_policy: Optional[Mapping[str, Any]] = None,
+    override_bedrock_credentials: Any = None,
+    override_bedrock_guardrail: Optional[Mapping[str, Any]] = None,
+    lane: Optional[str] = None,
+    public_sanitizer=None,
     # Per-call role controlling whether the child can further delegate.
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
@@ -1202,7 +1464,25 @@ def _build_child_agent(
         parent_api_key = parent_agent._client_kwargs.get("api_key")
 
     # Resolve the child's effective model early so it can ride on every event.
-    effective_model_for_cb = model or getattr(parent_agent, "model", None)
+    _model_for_cb = (
+        model if lane is not None else model or getattr(parent_agent, "model", None)
+    )
+    effective_model_for_cb = (
+        _model_for_cb if isinstance(_model_for_cb, str) and _model_for_cb else None
+    )
+    if lane is not None:
+        _provider_for_cb = "copilot-acp" if override_acp_command else override_provider
+    else:
+        _provider_for_cb = (
+            "copilot-acp"
+            if override_acp_command
+            else override_provider or getattr(parent_agent, "provider", None)
+        )
+    effective_provider_for_cb = (
+        _provider_for_cb
+        if isinstance(_provider_for_cb, str) and _provider_for_cb
+        else None
+    )
 
     # Build progress callback to relay tool calls to parent display.
     # Identity kwargs thread the subagent_id through every emitted event so the
@@ -1216,9 +1496,12 @@ def _build_child_agent(
         subagent_id=subagent_id,
         parent_id=parent_subagent_id,
         depth=tui_depth,
+        lane=lane,
         model=effective_model_for_cb,
+        provider=effective_provider_for_cb,
         toolsets=child_toolsets,
         session_ref=child_session_ref,
+        public_sanitizer=public_sanitizer,
     )
 
     # Each subagent gets its own iteration budget capped at max_iterations
@@ -1240,19 +1523,36 @@ def _build_child_agent(
         child_thinking_cb = _child_thinking
 
     # Resolve effective credentials: config override > parent inherit
-    effective_model = model or parent_agent.model
-    effective_provider = override_provider or getattr(parent_agent, "provider", None)
-    effective_base_url = override_base_url or parent_agent.base_url
-    if not override_base_url:
-        effective_base_url = _inherit_parent_base_url(parent_agent, effective_base_url)
-    effective_api_key = override_api_key or parent_api_key
+    effective_model = (model or "") if lane is not None else model or parent_agent.model
+    effective_provider = (
+        override_provider
+        if lane is not None
+        else override_provider or getattr(parent_agent, "provider", None)
+    )
+    if lane is not None:
+        # A named provider lane is a closed route.  Some providers use their
+        # SDK's default endpoint and therefore resolve ``base_url`` to None;
+        # treating that as "inherit" would silently send the child back through
+        # the parent's custom endpoint.
+        effective_base_url = override_base_url
+    else:
+        effective_base_url = override_base_url or parent_agent.base_url
+        if not override_base_url:
+            effective_base_url = _inherit_parent_base_url(parent_agent, effective_base_url)
+    effective_api_key = (
+        override_api_key
+        if lane is not None
+        else override_api_key or parent_api_key
+    )
     # Bug #20558 / PR #20563: api_mode must NOT be inherited when the child uses a
     # different provider than the parent — each provider has its own API surface
     # (e.g. MiniMax uses anthropic_messages, DeepSeek uses chat_completions).
     # Inheriting the parent's mode causes 404 errors when the child routes to the
     # wrong endpoint.  Derive the mode from the target provider when it differs.
     _parent_provider = getattr(parent_agent, "provider", None) or ""
-    if override_api_mode is not None:
+    if lane is not None:
+        effective_api_mode = override_api_mode
+    elif override_api_mode is not None:
         effective_api_mode = override_api_mode
     elif effective_provider != _parent_provider:
         effective_api_mode = None  # force re-derivation from provider's defaults
@@ -1265,19 +1565,25 @@ def _build_child_agent(
         import shutil as _shutil
 
         if not _shutil.which(override_acp_command):
+            if lane is not None:
+                raise ValueError(
+                    f"ACP command for delegation lane '{lane}' is unavailable: "
+                    f"{override_acp_command}"
+                )
             logger.warning(
-                "Ignoring acp_command=%r: binary not found on PATH; "
+                "Ignoring configured ACP command: binary not found on PATH; "
                 "falling back to default transport.",
-                override_acp_command,
             )
             override_acp_command = None
             override_acp_args = None
-    effective_acp_command = override_acp_command or getattr(
-        parent_agent, "acp_command", None
+    effective_acp_command = (
+        override_acp_command
+        if lane is not None
+        else override_acp_command or getattr(parent_agent, "acp_command", None)
     )
     effective_acp_args = list(
-        override_acp_args
-        if override_acp_args is not None
+        (override_acp_args or [])
+        if lane is not None or override_acp_args is not None
         else (getattr(parent_agent, "acp_args", []) or [])
     )
 
@@ -1295,33 +1601,48 @@ def _build_child_agent(
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
-    # Resolve reasoning config: delegation override > parent inherit
+    # A named lane resolves reasoning once, before any child is built, so a
+    # config reload cannot split one batch across different routes. Direct
+    # internal callers that omit the override retain the legacy config lookup.
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
-    child_reasoning = parent_reasoning
-    try:
-        # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
-        # False (``reasoning_effort: false``) to "" and inherit the parent
-        # instead of disabling thinking for children.
-        delegation_effort = delegation_cfg.get("reasoning_effort")
-        if delegation_effort or delegation_effort is False:
-            from hermes_constants import parse_reasoning_effort
+    if override_reasoning_config is not None:
+        child_reasoning = dict(_thaw_route_value(override_reasoning_config) or {})
+    else:
+        child_reasoning = (
+            copy.deepcopy(dict(parent_reasoning))
+            if isinstance(parent_reasoning, Mapping)
+            else {}
+        )
+        try:
+            # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
+            # False (``reasoning_effort: false``) to "" and inherit the parent
+            # instead of disabling thinking for children.
+            delegation_effort = delegation_cfg.get("reasoning_effort")
+            if delegation_effort or delegation_effort is False:
+                from hermes_constants import parse_reasoning_effort
 
-            parsed = parse_reasoning_effort(delegation_effort)
-            if parsed is not None:
-                child_reasoning = parsed
-            else:
-                logger.warning(
-                    "Unknown delegation.reasoning_effort '%s', inheriting parent level",
-                    delegation_effort,
-                )
-    except Exception as exc:
-        logger.debug("Could not load delegation reasoning_effort: %s", exc)
+                parsed = parse_reasoning_effort(delegation_effort)
+                if parsed is not None:
+                    child_reasoning = parsed
+                else:
+                    logger.warning(
+                        "Unknown delegation.reasoning_effort '%s', inheriting parent level",
+                        delegation_effort,
+                    )
+        except Exception as exc:
+            logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
     # Inherit the parent's fallback provider chain so subagents can recover
     # from rate-limits and credential exhaustion exactly like the top-level
     # agent does.  _fallback_chain is a list accepted by AIAgent's
     # fallback_model parameter (which handles both list and dict forms).
-    parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
+    # A named lane is an immutable provider/model route.  Inheriting the
+    # parent's fallback chain would let a rate limit silently move the child to
+    # an untrusted provider/model outside that lane. Omitted-lane calls retain
+    # the legacy fallback behavior.
+    parent_fallback = (
+        None if lane is not None else getattr(parent_agent, "_fallback_chain", None) or None
+    )
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
@@ -1330,31 +1651,51 @@ def _build_child_agent(
     # parent-level OpenRouter filters (e.g. `only=["Anthropic"]`) would
     # silently force the child back onto the parent's provider. Clear the
     # filters in that case so the delegated provider is honoured.
-    child_providers_allowed = getattr(parent_agent, "providers_allowed", None)
-    child_providers_ignored = getattr(parent_agent, "providers_ignored", None)
-    child_providers_order = getattr(parent_agent, "providers_order", None)
-    child_provider_sort = getattr(parent_agent, "provider_sort", None)
-    child_provider_require_parameters = getattr(
-        parent_agent, "provider_require_parameters", False
-    )
-    child_provider_data_collection = getattr(
-        parent_agent, "provider_data_collection", None
-    ) or ""
-    child_openrouter_min_coding_score = getattr(parent_agent, "openrouter_min_coding_score", None)
-    if override_provider:
-        child_providers_allowed = None
-        child_providers_ignored = None
-        child_providers_order = None
-        child_provider_sort = None
-        child_provider_require_parameters = False
-        child_provider_data_collection = ""
-        # Note: openrouter_min_coding_score is model-gated (only emitted on
-        # openrouter/pareto-code), so we keep it inherited even when the
-        # provider is overridden — it's a no-op on any other model.
+    if lane is not None:
+        # Named routes carry the complete provider-routing policy resolved at
+        # invocation start. Never reread the mutable parent here: doing so can
+        # widen an allowlist or split a batch across different upstreams.
+        child_provider_routing = _thaw_route_value(override_provider_routing or {})
+        child_providers_allowed = child_provider_routing.get("providers_allowed")
+        child_providers_ignored = child_provider_routing.get("providers_ignored")
+        child_providers_order = child_provider_routing.get("providers_order")
+        child_provider_sort = child_provider_routing.get("provider_sort")
+        child_provider_require_parameters = child_provider_routing.get(
+            "provider_require_parameters", False
+        )
+        child_provider_data_collection = child_provider_routing.get(
+            "provider_data_collection", ""
+        )
+        child_openrouter_min_coding_score = child_provider_routing.get(
+            "openrouter_min_coding_score"
+        )
+    else:
+        child_providers_allowed = getattr(parent_agent, "providers_allowed", None)
+        child_providers_ignored = getattr(parent_agent, "providers_ignored", None)
+        child_providers_order = getattr(parent_agent, "providers_order", None)
+        child_provider_sort = getattr(parent_agent, "provider_sort", None)
+        child_provider_require_parameters = getattr(
+            parent_agent, "provider_require_parameters", False
+        )
+        child_provider_data_collection = getattr(
+            parent_agent, "provider_data_collection", None
+        ) or ""
+        child_openrouter_min_coding_score = getattr(
+            parent_agent, "openrouter_min_coding_score", None
+        )
+        if override_provider:
+            child_providers_allowed = None
+            child_providers_ignored = None
+            child_providers_order = None
+            child_provider_sort = None
+            child_provider_require_parameters = False
+            child_provider_data_collection = ""
+            # Preserve the omitted-lane legacy behavior: the score is
+            # model-gated and historically remained inherited here.
 
     child_max_tokens = (
         override_max_tokens
-        if override_max_tokens is not None
+        if lane is not None or override_max_tokens is not None
         else getattr(parent_agent, "max_tokens", None)
     )
     child_optional_kwargs: Dict[str, Any] = {}
@@ -1393,11 +1734,26 @@ def _build_child_agent(
         provider_require_parameters=child_provider_require_parameters,
         provider_data_collection=child_provider_data_collection,
         request_overrides=(
-            dict(override_request_overrides or {})
-            if override_provider
-            else dict(getattr(parent_agent, "request_overrides", {}) or {})
+            _thaw_route_value(override_request_overrides or {})
+            if lane is not None or override_provider
+            else copy.deepcopy(
+                dict(getattr(parent_agent, "request_overrides", {}) or {})
+            )
         ),
         openrouter_min_coding_score=child_openrouter_min_coding_score,
+        frozen_http_policy=(
+            _thaw_route_value(override_http_policy or {})
+            if lane is not None
+            else None
+        ),
+        frozen_bedrock_credentials=(
+            override_bedrock_credentials if lane is not None else None
+        ),
+        frozen_bedrock_guardrail=(
+            _thaw_route_value(override_bedrock_guardrail or {})
+            if lane is not None
+            else None
+        ),
         tool_progress_callback=child_progress_cb,
         iteration_budget=None,  # fresh budget per subagent
         **child_optional_kwargs,
@@ -1411,6 +1767,11 @@ def _build_child_agent(
     # Stash the post-degrade role for introspection (leaf if the
     # kill switch or depth bounded the caller's requested role).
     child._delegate_role = effective_role
+    setattr(child, "_delegate_lane", lane)
+    setattr(child, "_delegate_provider", effective_provider_for_cb)
+    setattr(child, "_delegate_model", effective_model_for_cb)
+    setattr(child, "_delegate_public_sanitizer", public_sanitizer)
+    setattr(child, "_delegate_progress_callback", child_progress_cb)
     # Stash subagent identity for nested-delegation event propagation and
     # for _run_single_child / interrupt_subagent to look up by id.
     child._subagent_id = subagent_id
@@ -1425,13 +1786,19 @@ def _build_child_agent(
     if parent_sid and getattr(child, "_session_init_model_config", None) is not None:
         child._session_init_model_config["_delegate_from"] = parent_sid
 
-    # Share a credential pool with the child when possible so subagents can
-    # rotate credentials on rate limits instead of getting pinned to one key.
-    child_pool = _resolve_child_credential_pool(
-        effective_provider, parent_agent, effective_base_url
-    )
-    if child_pool is not None:
-        child._credential_pool = child_pool
+    if lane is not None:
+        # Named lanes are immutable route snapshots. A child-local or shared
+        # credential pool can swap its API key/base URL immediately before the
+        # call, splitting a batch across accounts or endpoints that were not in
+        # the resolved lane. Pin the constructor credential for the invocation.
+        setattr(child, "_credential_pool", None)
+    else:
+        # Legacy omitted-lane calls retain credential-pool rotation.
+        child_pool = _resolve_child_credential_pool(
+            effective_provider, parent_agent, effective_base_url
+        )
+        if child_pool is not None:
+            setattr(child, "_credential_pool", child_pool)
 
     # Register child for interrupt propagation
     if hasattr(parent_agent, "_active_children"):
@@ -1461,10 +1828,15 @@ def _build_child_agent(
             child_session_id=getattr(child, "session_id", None),
             child_subagent_id=subagent_id,
             child_role=effective_role,
+            child_lane=lane,
+            child_provider=effective_provider_for_cb,
+            child_model=effective_model_for_cb,
             child_goal=goal,
         )
-    except Exception:
-        logger.debug("subagent_start hook invocation failed", exc_info=True)
+    except Exception as exc:
+        logger.debug(
+            "subagent_start hook invocation failed (%s)", type(exc).__name__
+        )
 
     return child
 
@@ -1529,15 +1901,12 @@ def _dump_subagent_timeout_diagnostic(
 
         _w("## Child config")
         for attr in (
-            "model", "provider", "api_mode", "base_url", "max_iterations",
+            "model", "provider", "max_iterations",
             "quiet_mode", "skip_memory", "skip_context_files", "platform",
-            "_delegate_role", "_delegate_depth",
+            "_delegate_lane", "_delegate_role", "_delegate_depth",
         ):
             try:
                 val = getattr(child, attr, None)
-                # Redact api_key-shaped values defensively
-                if isinstance(val, str) and attr == "base_url":
-                    pass
                 _w(f"  {attr}: {val!r}")
             except Exception:
                 _w(f"  {attr}: <unreadable>")
@@ -1606,6 +1975,16 @@ def _dump_subagent_timeout_diagnostic(
         _w("  Common causes: oversized prompt rejected by provider, transport hang,")
         _w("  credential resolution stuck. See issue #14726 for context.")
 
+        sanitizer = getattr(child, "_delegate_public_sanitizer", None)
+        if callable(sanitizer):
+            sanitized_lines = sanitizer(lines)
+            if not isinstance(sanitized_lines, list) or not all(
+                isinstance(line, str) for line in sanitized_lines
+            ):
+                raise TypeError("route sanitizer returned invalid diagnostic payload")
+            lines = sanitized_lines
+        else:
+            lines = [redact_sensitive_text(line) for line in lines]
         dump_path.write_text("\n".join(lines), encoding="utf-8")
         return str(dump_path)
     except Exception as exc:
@@ -1800,6 +2179,32 @@ def _run_single_child(
     Returns a structured result dict.
     """
     child_start = time.monotonic()
+    route_lane = getattr(child, "_delegate_lane", None)
+    route_provider = getattr(child, "_delegate_provider", None)
+    configured_route_model = getattr(child, "_delegate_model", None)
+
+    def _result_model() -> Optional[str]:
+        if route_lane:
+            return configured_route_model
+        # Provider fallback mutates child.model during run_conversation(), so
+        # omitted-lane compatibility requires reading it at result creation.
+        current = getattr(child, "model", None)
+        return current if isinstance(current, str) else configured_route_model
+
+    def _result_provider() -> Optional[str]:
+        if route_lane:
+            return route_provider
+        # Keep provider:model as one post-fallback identity pair on the legacy
+        # omitted-lane path. Named lanes deliberately remain frozen.
+        current = getattr(child, "provider", None)
+        return current if isinstance(current, str) else route_provider
+
+    public_sanitizer = getattr(child, "_delegate_public_sanitizer", None)
+    if (
+        getattr(public_sanitizer, "_is_delegation_route_sanitizer", None)
+        is not True
+    ):
+        public_sanitizer = None
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
@@ -1923,11 +2328,13 @@ def _run_single_child(
                 "parent_id": _parent_sid if isinstance(_parent_sid, str) else None,
                 "depth": _tui_depth,
                 "goal": goal,
+                "lane": getattr(child, "_delegate_lane", None),
                 "model": (
-                    getattr(child, "model", None)
-                    if isinstance(getattr(child, "model", None), str)
+                    getattr(child, "_delegate_model", None)
+                    if isinstance(getattr(child, "_delegate_model", None), str)
                     else None
                 ),
+                "provider": getattr(child, "_delegate_provider", None),
                 "started_at": time.time(),
                 "status": "running",
                 "tool_count": 0,
@@ -2065,9 +2472,12 @@ def _run_single_child(
                         preview=(
                             f"Timed out after {duration}s"
                             if is_timeout
-                            else str(_timeout_exc)
+                            else _safe_delegation_exception(
+                                _timeout_exc, "subagent execution failed"
+                            )
                         ),
-                        status="timeout" if is_timeout else "error",
+                        status="failed",
+                        exit_reason="timeout" if is_timeout else "error",
                         duration_seconds=duration,
                         summary="",
                     )
@@ -2091,11 +2501,16 @@ def _run_single_child(
                         f"stuck on a slow API call or unresponsive network request."
                     )
             else:
-                _err = str(_timeout_exc)
+                _err = _safe_delegation_exception(
+                    _timeout_exc, "subagent execution failed"
+                )
 
             return {
                 "task_index": task_index,
-                "status": "timeout" if is_timeout else "error",
+                "lane": route_lane,
+                "provider": _result_provider(),
+                "model": _result_model(),
+                "status": "failed",
                 "summary": None,
                 "error": _err,
                 "exit_reason": "timeout" if is_timeout else "error",
@@ -2114,13 +2529,35 @@ def _run_single_child(
             try:
                 child_progress_cb._flush()
             except Exception as e:
-                logger.debug("Progress callback flush failed: %s", e)
+                logger.debug(
+                    "Progress callback flush failed (%s)", type(e).__name__
+                )
 
         duration = round(time.monotonic() - child_start, 2)
 
-        summary = result.get("final_response") or ""
+        raw_summary = result.get("final_response")
+        summary = raw_summary if isinstance(raw_summary, str) else ""
         completed = result.get("completed", False)
         interrupted = result.get("interrupted", False)
+        reported_error = result.get("error")
+        explicit_status = result.get("status")
+        explicit_status = (
+            explicit_status.strip().lower()
+            if isinstance(explicit_status, str)
+            else None
+        )
+        terminal_failure_statuses = {
+            "failed",
+            "error",
+            "timeout",
+            "interrupted",
+            "cancelled",
+        }
+        reported_failed = (
+            result.get("failed") is True
+            or bool(reported_error)
+            or explicit_status in terminal_failure_statuses
+        )
         api_calls = result.get("api_calls", 0)
 
         # The child emits the literal "(empty)" sentinel (see run_agent.py) when
@@ -2130,8 +2567,21 @@ def _run_single_child(
         # it instead of silently accepting zero-content "success".
         _empty_sentinel = summary.strip() == "(empty)"
 
-        if interrupted:
+        if explicit_status in terminal_failure_statuses:
+            status = (
+                "interrupted"
+                if explicit_status in {"interrupted", "cancelled"}
+                else "failed"
+            )
+        elif interrupted:
             status = "interrupted"
+        elif reported_failed:
+            # A failed model/provider response is not usable output merely
+            # because it also contains text.  Provider error bodies can echo
+            # endpoints, credentials, request overrides, fallback details, or
+            # ACP commands, so no child-supplied failure text crosses the
+            # delegation boundary.
+            status = "failed"
         elif summary and not _empty_sentinel:
             # A summary means the subagent produced usable output.
             # exit_reason ("completed" vs "max_iterations") already
@@ -2177,8 +2627,18 @@ def _run_single_child(
                         tool_trace[-1].update(result_meta)
 
         # Determine exit reason
-        if interrupted:
+        if explicit_status in terminal_failure_statuses:
+            reported_exit_reason = result.get("exit_reason")
+            exit_reason = (
+                reported_exit_reason.strip()
+                if isinstance(reported_exit_reason, str)
+                and reported_exit_reason.strip()
+                else explicit_status
+            )
+        elif interrupted:
             exit_reason = "interrupted"
+        elif reported_failed or _empty_sentinel:
+            exit_reason = "error"
         elif completed:
             exit_reason = "completed"
         else:
@@ -2187,15 +2647,15 @@ def _run_single_child(
         # Extract token counts (safe for mock objects)
         _input_tokens = getattr(child, "session_prompt_tokens", 0)
         _output_tokens = getattr(child, "session_completion_tokens", 0)
-        _model = getattr(child, "model", None)
-
         entry: Dict[str, Any] = {
             "task_index": task_index,
+            "lane": route_lane,
+            "provider": _result_provider(),
             "status": status,
-            "summary": summary,
+            "summary": summary if status == "completed" else None,
             "api_calls": api_calls,
             "duration_seconds": duration,
-            "model": _model if isinstance(_model, str) else None,
+            "model": _result_model(),
             "exit_reason": exit_reason,
             "tokens": {
                 "input": (
@@ -2224,8 +2684,10 @@ def _run_single_child(
                 else 0.0
             ),
         }
-        if status == "failed":
-            entry["error"] = result.get("error", "Subagent did not produce a response.")
+        if status != "completed":
+            entry["error"] = "DelegationError: subagent reported failure"
+        elif public_sanitizer is not None:
+            entry["summary"] = public_sanitizer(entry["summary"])
 
         # Cross-agent file-state reminder.  If this subagent wrote any
         # files the parent had already read, surface it so the parent
@@ -2286,13 +2748,28 @@ def _run_single_child(
             }
         )[:40]
 
-        _output_tail = _extract_output_tail(result, max_entries=8, max_chars=600)
+        _output_tail = (
+            _extract_output_tail(result, max_entries=8, max_chars=600)
+            if status == "completed"
+            else []
+        )
+        if public_sanitizer is not None:
+            # Sanitize the complete publication shape after every derived
+            # field (trace metadata, file reminders, path lists, output tail)
+            # has been added. Sanitizing only the raw summary leaves later
+            # observability enrichments as bypasses.
+            entry = public_sanitizer(entry)
+            _files_read = public_sanitizer(_files_read)
+            _files_written = public_sanitizer(_files_written)
+            _output_tail = public_sanitizer(_output_tail)
+        _public_completion_text = entry.get("summary") or entry.get("error", "")
 
         complete_kwargs: Dict[str, Any] = {
-            "preview": summary[:160] if summary else entry.get("error", ""),
+            "preview": _public_completion_text[:160],
             "status": status,
+            "exit_reason": exit_reason,
             "duration_seconds": duration,
-            "summary": summary[:500] if summary else entry.get("error", ""),
+            "summary": _public_completion_text[:500],
             "input_tokens": (
                 int(_input_tokens) if isinstance(_input_tokens, (int, float)) else 0
             ),
@@ -2315,6 +2792,9 @@ def _run_single_child(
             except (TypeError, ValueError):
                 pass
 
+        if public_sanitizer is not None:
+            complete_kwargs = public_sanitizer(complete_kwargs)
+
         if child_progress_cb:
             try:
                 child_progress_cb("subagent.complete", **complete_kwargs)
@@ -2325,23 +2805,31 @@ def _run_single_child(
 
     except Exception as exc:
         duration = round(time.monotonic() - child_start, 2)
-        logging.exception(f"[subagent-{task_index}] failed")
+        safe_error = _safe_delegation_exception(exc, "subagent execution failed")
+        logger.error(
+            "[subagent-%d] failed (%s)", task_index, type(exc).__name__
+        )
         if child_progress_cb:
             try:
                 child_progress_cb(
                     "subagent.complete",
-                    preview=str(exc),
+                    preview=safe_error,
                     status="failed",
+                    exit_reason="error",
                     duration_seconds=duration,
-                    summary=str(exc),
+                    summary=safe_error,
                 )
             except Exception as e:
                 logger.debug("Progress callback failure relay failed: %s", e)
         return {
             "task_index": task_index,
-            "status": "error",
+            "lane": route_lane,
+            "provider": _result_provider(),
+            "model": _result_model(),
+            "status": "failed",
             "summary": None,
-            "error": str(exc),
+            "error": safe_error,
+            "exit_reason": "error",
             "api_calls": 0,
             "duration_seconds": duration,
             "_child_role": getattr(child, "_delegate_role", None),
@@ -2431,6 +2919,7 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     parent_agent=None,
+    lane: Optional[str] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -2487,8 +2976,11 @@ def delegate_task(
             }
         )
 
-    # Load config
+    # Load config. Production views retain the complete generation used to
+    # derive this delegation section so named routes never reload ambient
+    # credentials/transport from a newer generation.
     cfg = _load_config()
+    config_snapshot = getattr(cfg, "_full_config_snapshot", None)
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     # Model-supplied max_iterations is ignored — the config value is authoritative
     # so users get predictable budgets. The kwarg is retained for internal callers
@@ -2503,15 +2995,18 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
+    # Resolve one immutable route snapshot for the entire call. A config reload
+    # while children are being built cannot split one batch across lanes.
     try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
+        route = _resolve_delegation_route(
+            cfg,
+            parent_agent,
+            lane=lane,
+            config_snapshot=config_snapshot,
+        )
     except ValueError as exc:
         return tool_error(str(exc))
+
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -2545,8 +3040,9 @@ def delegate_task(
             return tool_error(
                 f"Task {i} must be an object, got {type(task).__name__}."
             )
-        if not task.get("goal", "").strip():
-            return tool_error(f"Task {i} is missing a 'goal'.")
+        task_goal = task.get("goal")
+        if not isinstance(task_goal, str) or not task_goal.strip():
+            return tool_error(f"Task {i} goal must be a non-empty string.")
 
     overall_start = time.monotonic()
     results = []
@@ -2567,7 +3063,11 @@ def delegate_task(
     )
 
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context
+        task_list,
+        context,
+        lane=route.lane,
+        provider=route.resolved_provider,
+        model=route.resolved_model,
     )
 
     # Save parent tool names BEFORE any child construction mutates the global.
@@ -2581,32 +3081,58 @@ def delegate_task(
     # Wrapped in try/finally so the global is always restored even if a
     # child build raises (otherwise _last_resolved_tool_names stays corrupted).
     children = []
+    construction_failure = None
     try:
         for i, t in enumerate(task_list):
+            public_sanitizer = (
+                _route_publication_sanitizer(route)
+                if route.lane is not None
+                else None
+            )
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
-            child = _build_child_agent(
-                task_index=i,
-                goal=t["goal"],
-                context=t.get("context"),
-                # Subagents always inherit the parent's toolsets; the model
-                # cannot choose or narrow them (no model-facing toolsets arg).
-                toolsets=None,
-                model=creds["model"],
-                max_iterations=effective_max_iter,
-                task_count=n_tasks,
-                parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_request_overrides=creds.get("request_overrides"),
-                override_max_tokens=creds.get("max_output_tokens"),
-                override_acp_command=creds.get("command"),
-                override_acp_args=creds.get("args"),
-                role=effective_role,
-            )
+            try:
+                child = _build_child_agent(
+                    task_index=i,
+                    goal=t["goal"],
+                    context=t.get("context"),
+                    # Subagents always inherit the parent's toolsets; the model
+                    # cannot choose or narrow them (no model-facing toolsets arg).
+                    toolsets=None,
+                    model=route.model,
+                    max_iterations=effective_max_iter,
+                    task_count=n_tasks,
+                    parent_agent=parent_agent,
+                    override_provider=route.provider,
+                    override_base_url=route.base_url,
+                    override_api_key=route.api_key,
+                    override_api_mode=route.api_mode,
+                    override_request_overrides=(
+                        dict(route.request_overrides) if route.request_overrides else None
+                    ),
+                    override_max_tokens=route.max_output_tokens,
+                    override_acp_command=route.command,
+                    override_acp_args=(
+                        list(route.args) if route.args is not None else None
+                    ),
+                    override_reasoning_config=route.reasoning_config,
+                    override_provider_routing=route.provider_routing,
+                    override_http_policy=route.http_policy,
+                    override_bedrock_credentials=route.bedrock_credentials,
+                    override_bedrock_guardrail=route.bedrock_guardrail,
+                    lane=route.lane,
+                    public_sanitizer=public_sanitizer,
+                    role=effective_role,
+                )
+            except Exception as exc:
+                construction_failure = (i, exc)
+                logger.error(
+                    "Subagent construction failed at task %d (%s); aborting batch",
+                    i,
+                    type(exc).__name__,
+                )
+                break
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
             # Tee the child's progress events into its live transcript log.
@@ -2616,14 +3142,126 @@ def delegate_task(
             # callback is None and the wrapper still records events.
             _writer = live_writers[i] if i < len(live_writers) else None
             if _writer is not None:
-                child.tool_progress_callback = wrap_progress_callback(
-                    getattr(child, "tool_progress_callback", None), _writer
+                wrapped_progress_cb = wrap_progress_callback(
+                    getattr(child, "_delegate_progress_callback", None),
+                    _writer,
+                    public_sanitizer=public_sanitizer,
                 )
+                setattr(child, "tool_progress_callback", wrapped_progress_cb)
+                setattr(child, "_delegate_progress_callback", wrapped_progress_cb)
                 child._live_transcript_path = str(_writer.path)
             children.append((i, t, child))
     finally:
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
+
+    if construction_failure is not None:
+        failed_index, construction_exc = construction_failure
+        failed_error = _safe_delegation_exception(
+            construction_exc, "subagent construction failed"
+        )
+        aborted_error = "DelegationError: batch aborted during child construction"
+        results = []
+        for index, _task in enumerate(task_list):
+            entry = {
+                "task_index": index,
+                "lane": route.lane,
+                "provider": route.resolved_provider,
+                "model": route.resolved_model,
+                "status": "failed",
+                "exit_reason": "error",
+                "summary": None,
+                "error": failed_error if index == failed_index else aborted_error,
+                "api_calls": 0,
+                "duration_seconds": 0,
+            }
+            results.append(entry)
+
+        try:
+            from hermes_cli.plugins import invoke_hook as construction_hook
+        except Exception:
+            construction_hook = None
+        for _index, _task, child in children:
+            child_progress_cb = getattr(child, "_delegate_progress_callback", None)
+            if callable(child_progress_cb):
+                try:
+                    child_progress_cb(
+                        "subagent.complete",
+                        preview=aborted_error,
+                        status="failed",
+                        duration_seconds=0,
+                        summary=aborted_error,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "construction-failure completion relay failed (%s)",
+                        type(exc).__name__,
+                    )
+            if hasattr(parent_agent, "_active_children"):
+                try:
+                    active_lock = getattr(parent_agent, "_active_children_lock", None)
+                    if active_lock:
+                        with active_lock:
+                            parent_agent._active_children.remove(child)
+                    else:
+                        parent_agent._active_children.remove(child)
+                except (ValueError, UnboundLocalError):
+                    pass
+            if construction_hook is not None:
+                try:
+                    construction_hook(
+                        "subagent_stop",
+                        parent_session_id=getattr(parent_agent, "session_id", None),
+                        parent_turn_id=(
+                            getattr(parent_agent, "_current_turn_id", "") or ""
+                        ),
+                        child_session_id=getattr(child, "session_id", None),
+                        child_role=getattr(child, "_delegate_role", None),
+                        child_lane=route.lane,
+                        child_provider=route.resolved_provider,
+                        child_model=route.resolved_model,
+                        child_summary=None,
+                        child_status="failed",
+                        duration_ms=0,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "construction-failure stop hook failed (%s)",
+                        type(exc).__name__,
+                    )
+            try:
+                if hasattr(child, "close"):
+                    child.close()
+            except Exception as exc:
+                logger.debug(
+                    "construction-failure child cleanup failed (%s)",
+                    type(exc).__name__,
+                )
+
+        for index, entry in enumerate(results):
+            writer = live_writers[index] if index < len(live_writers) else None
+            if writer is not None:
+                try:
+                    writer.finalize(entry)
+                except Exception as exc:
+                    logger.debug(
+                        "Live transcript construction-failure finalize failed (%s)",
+                        type(exc).__name__,
+                    )
+                if index < len(live_paths):
+                    entry["live_transcript"] = live_paths[index]
+
+        update_manifest_statuses(live_deleg_id, results)
+        combined = {
+            "lane": route.lane,
+            "provider": route.resolved_provider,
+            "model": route.resolved_model,
+            "results": results,
+            "total_duration_seconds": round(time.monotonic() - overall_start, 2),
+        }
+        if live_paths:
+            combined["live_transcripts"] = list(live_paths)
+        return json.dumps(combined, ensure_ascii=False)
 
     def _execute_and_aggregate() -> dict:
         """Run all built children (1 or N), join on them, aggregate results,
@@ -2651,15 +3289,93 @@ def delegate_task(
             from tools.daemon_pool import DaemonThreadPoolExecutor
             with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
                 futures = {}
-                for i, t, child in children:
-                    future = executor.submit(
-                        _run_single_child,
-                        task_index=i,
-                        goal=t["goal"],
-                        child=child,
-                        parent_agent=parent_agent,
-                    )
+                submission_failure = None
+                for child_position, (i, t, child) in enumerate(children):
+                    try:
+                        future = executor.submit(
+                            _run_single_child,
+                            task_index=i,
+                            goal=t["goal"],
+                            child=child,
+                            parent_agent=parent_agent,
+                        )
+                    except Exception as exc:
+                        submission_failure = (child_position, exc)
+                        logger.error(
+                            "Subagent executor submission failed at task %d (%s); "
+                            "terminalizing unsubmitted children",
+                            i,
+                            type(exc).__name__,
+                        )
+                        break
                     futures[future] = i
+
+                if submission_failure is not None:
+                    failed_position, submission_exc = submission_failure
+                    for child_position in range(failed_position, len(children)):
+                        i, _task, child = children[child_position]
+                        error = (
+                            _safe_delegation_exception(
+                                submission_exc, "subagent scheduling failed"
+                            )
+                            if child_position == failed_position
+                            else "DelegationError: batch aborted during child scheduling"
+                        )
+                        progress_callback = getattr(
+                            child, "_delegate_progress_callback", None
+                        )
+                        if callable(progress_callback):
+                            try:
+                                progress_callback(
+                                    "subagent.complete",
+                                    preview=error,
+                                    status="failed",
+                                    duration_seconds=0,
+                                    summary=error,
+                                )
+                            except Exception as exc:
+                                logger.debug(
+                                    "submission-failure completion relay failed (%s)",
+                                    type(exc).__name__,
+                                )
+                        if hasattr(parent_agent, "_active_children"):
+                            try:
+                                active_lock = getattr(
+                                    parent_agent, "_active_children_lock", None
+                                )
+                                if active_lock:
+                                    with active_lock:
+                                        parent_agent._active_children.remove(child)
+                                else:
+                                    parent_agent._active_children.remove(child)
+                            except (ValueError, UnboundLocalError):
+                                pass
+                        try:
+                            if hasattr(child, "close"):
+                                child.close()
+                        except Exception as exc:
+                            logger.debug(
+                                "submission-failure child cleanup failed (%s)",
+                                type(exc).__name__,
+                            )
+                        results.append(
+                            {
+                                "task_index": i,
+                                "lane": route.lane,
+                                "provider": route.resolved_provider,
+                                "model": route.resolved_model,
+                                "status": "failed",
+                                "exit_reason": "error",
+                                "summary": None,
+                                "error": error,
+                                "api_calls": 0,
+                                "duration_seconds": 0,
+                                "_child_role": getattr(
+                                    child, "_delegate_role", None
+                                ),
+                            }
+                        )
+                        completed_count += 1
 
                 # Poll futures with interrupt checking.  as_completed() blocks
                 # until ALL futures finish — if a child agent gets stuck,
@@ -2684,9 +3400,15 @@ def delegate_task(
                                 except Exception as exc:
                                     entry = {
                                         "task_index": idx,
-                                        "status": "error",
+                                        "lane": route.lane,
+                                        "provider": route.resolved_provider,
+                                        "model": route.resolved_model,
+                                        "status": "failed",
+                                        "exit_reason": "error",
                                         "summary": None,
-                                        "error": str(exc),
+                                        "error": _safe_delegation_exception(
+                                            exc, "subagent execution failed"
+                                        ),
                                         "api_calls": 0,
                                         "duration_seconds": 0,
                                         "_child_role": getattr(
@@ -2696,7 +3418,11 @@ def delegate_task(
                             else:
                                 entry = {
                                     "task_index": idx,
+                                    "lane": route.lane,
+                                    "provider": route.resolved_provider,
+                                    "model": route.resolved_model,
                                     "status": "interrupted",
+                                    "exit_reason": "interrupted",
                                     "summary": None,
                                     "error": "Parent agent interrupted — child did not finish in time",
                                     "api_calls": 0,
@@ -2721,9 +3447,15 @@ def delegate_task(
                             idx = futures[future]
                             entry = {
                                 "task_index": idx,
-                                "status": "error",
+                                "lane": route.lane,
+                                "provider": route.resolved_provider,
+                                "model": route.resolved_model,
+                                "status": "failed",
+                                "exit_reason": "error",
                                 "summary": None,
-                                "error": str(exc),
+                                "error": _safe_delegation_exception(
+                                    exc, "subagent execution failed"
+                                ),
                                 "api_calls": 0,
                                 "duration_seconds": 0,
                                 "_child_role": getattr(
@@ -2834,12 +3566,17 @@ def delegate_task(
                     parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
                     child_session_id=getattr(_child_agent, "session_id", None),
                     child_role=child_role,
+                    child_lane=entry.get("lane"),
+                    child_provider=entry.get("provider"),
+                    child_model=entry.get("model"),
                     child_summary=entry.get("summary"),
                     child_status=entry.get("status"),
                     duration_ms=int((entry.get("duration_seconds") or 0) * 1000),
                 )
-            except Exception:
-                logger.debug("subagent_stop hook invocation failed", exc_info=True)
+            except Exception as exc:
+                logger.debug(
+                    "subagent_stop hook invocation failed (%s)", type(exc).__name__
+                )
 
         # Fold the aggregated child cost into the parent's session total.  This is
         # additive — each delegate_task call contributes its own children — so
@@ -2885,7 +3622,31 @@ def delegate_task(
                     entry["live_transcript"] = live_paths[_idx]
         update_manifest_statuses(live_deleg_id, results)
 
+        if route.lane is None:
+            def _completed_identity(
+                field: str, fallback: Optional[str]
+            ) -> Optional[str]:
+                values = {
+                    entry.get(field)
+                    for entry in results
+                    if isinstance(entry.get(field), str) and entry.get(field)
+                }
+                if len(values) == 1:
+                    return values.pop()
+                return fallback if not values else None
+
+            combined_provider = _completed_identity(
+                "provider", route.resolved_provider
+            )
+            combined_model = _completed_identity("model", route.resolved_model)
+        else:
+            combined_provider = route.resolved_provider
+            combined_model = route.resolved_model
+
         combined: Dict[str, Any] = {
+            "lane": route.lane,
+            "provider": combined_provider,
+            "model": combined_model,
             "results": results,
             "total_duration_seconds": total_duration,
         }
@@ -3006,7 +3767,9 @@ def delegate_task(
             # parent's toolsets (no model-facing toolsets arg).
             toolsets=None,
             role=top_role,
-            model=creds["model"],
+            lane=route.lane,
+            provider=route.resolved_provider,
+            model=route.resolved_model,
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
             parent_session_id=_parent_session_id,
@@ -3038,6 +3801,9 @@ def delegate_task(
                 "count": n,
                 "delegation_id": dispatch["delegation_id"],
                 "goals": _goals,
+                "lane": route.lane,
+                "provider": route.resolved_provider,
+                "model": route.resolved_model,
                 "note": note,
             }
             if live_paths:
@@ -3058,6 +3824,19 @@ def delegate_task(
             "batch synchronously instead.",
             dispatch.get("error", "rejected"),
         )
+        if hasattr(parent_agent, "_active_children"):
+            _ac_lock = getattr(parent_agent, "_active_children_lock", None)
+
+            def _reattach_children() -> None:
+                for _child in _child_agents:
+                    if _child not in parent_agent._active_children:
+                        parent_agent._active_children.append(_child)
+
+            if _ac_lock:
+                with _ac_lock:
+                    _reattach_children()
+            else:
+                _reattach_children()
         _cap_result = _execute_and_aggregate()
         if isinstance(_cap_result, dict):
             _cap_result["note"] = (
@@ -3134,9 +3913,8 @@ def _resolve_child_credential_pool(
                 return pool
         except Exception as exc:
             logger.debug(
-                "Could not resolve custom credential pool for child endpoint '%s': %s",
-                effective_base_url,
-                exc,
+                "Could not resolve custom credential pool for child route (%s)",
+                type(exc).__name__,
             )
         return None
 
@@ -3151,14 +3929,19 @@ def _resolve_child_credential_pool(
             return pool
     except Exception as exc:
         logger.debug(
-            "Could not load credential pool for child provider '%s': %s",
+            "Could not load credential pool for child provider '%s' (%s)",
             effective_provider,
-            exc,
+            type(exc).__name__,
         )
     return None
 
 
-def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+def _resolve_delegation_credentials(
+    cfg: dict,
+    parent_agent,
+    *,
+    config_snapshot: Optional[Dict[str, Any]] = None,
+) -> dict:
     """Resolve credentials for subagent delegation.
 
     If ``delegation.base_url`` is configured, subagents use that direct
@@ -3257,14 +4040,21 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
-        runtime = resolve_runtime_provider(requested=configured_provider, target_model=configured_model)
+        runtime_kwargs: Dict[str, Any] = {
+            "requested": configured_provider,
+            "target_model": configured_model,
+        }
+        if config_snapshot is not None:
+            runtime_kwargs["_config_snapshot"] = config_snapshot
+        runtime = resolve_runtime_provider(**runtime_kwargs)
     except Exception as exc:
         raise ValueError(
-            f"Cannot resolve delegation provider '{configured_provider}': {exc}. "
+            f"Cannot resolve delegation provider '{configured_provider}' "
+            f"({type(exc).__name__}). "
             f"Check that the provider is configured (API key set, valid provider name), "
             f"or set delegation.base_url/delegation.api_key for a direct endpoint. "
             f"Available providers: openrouter, nous, zai, kimi-coding, minimax."
-        ) from exc
+        ) from None
 
     api_key = runtime.get("api_key", "")
     if not api_key:
@@ -3280,10 +4070,441 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         "api_key": api_key,
         "api_mode": runtime.get("api_mode"),
         "request_overrides": dict(runtime.get("request_overrides") or {}),
+        "extra_headers": dict(runtime.get("extra_headers") or {}),
         "max_output_tokens": runtime.get("max_output_tokens"),
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
+        "bedrock_credentials": runtime.get("bedrock_credentials"),
+        "bedrock_guardrail_config": runtime.get("bedrock_guardrail_config"),
     }
+
+
+def _snapshot_named_route_http_policy(
+    creds: Mapping[str, Any],
+    parent_agent,
+    *,
+    inherit_parent_transport: bool,
+    config_snapshot: Optional[Mapping[str, Any]] = None,
+) -> Mapping[str, Any]:
+    """Freeze config-derived headers and TLS settings for a named route."""
+    if inherit_parent_transport:
+        parent_kwargs = getattr(parent_agent, "_client_kwargs", None)
+        parent_kwargs = parent_kwargs if isinstance(parent_kwargs, Mapping) else {}
+        policy: Dict[str, Any] = {}
+        parent_headers = parent_kwargs.get("default_headers")
+        if isinstance(parent_headers, Mapping) and parent_headers:
+            policy["default_headers"] = copy.deepcopy(dict(parent_headers))
+        for key in ("ssl_ca_cert", "ssl_verify"):
+            if key in parent_kwargs:
+                policy[key] = copy.deepcopy(parent_kwargs[key])
+        return _freeze_route_value(policy)
+
+    headers: Dict[str, str] = {}
+    tls: Dict[str, Any] = {}
+    try:
+        from hermes_cli.config import (
+            get_compatible_custom_providers,
+            get_custom_provider_extra_headers,
+            get_custom_provider_tls_settings,
+            load_config_readonly,
+            normalize_extra_headers,
+        )
+
+        full_config = (
+            dict(config_snapshot)
+            if isinstance(config_snapshot, Mapping)
+            else load_config_readonly()
+        )
+        model_config = full_config.get("model")
+        model_config = model_config if isinstance(model_config, Mapping) else {}
+        headers.update(normalize_extra_headers(model_config.get("default_headers")))
+        headers.update(normalize_extra_headers(model_config.get("extra_headers")))
+
+        # Runtime resolution may already have lifted a named provider's
+        # credential-bearing headers. Keep them even if the compatibility
+        # provider list cannot be rebuilt later.
+        headers.update(normalize_extra_headers(creds.get("extra_headers")))
+        entries = get_compatible_custom_providers(full_config)
+        base_url = str(creds.get("base_url") or "")
+        headers.update(get_custom_provider_extra_headers(base_url, entries))
+        tls.update(get_custom_provider_tls_settings(base_url, entries))
+    except Exception as exc:
+        # A named route must remain closed even when config policy resolution
+        # fails: freeze the policy resolved so far rather than allowing each
+        # child constructor to perform a later mutable lookup.
+        logger.debug(
+            "Could not snapshot named-route HTTP policy (%s)",
+            type(exc).__name__,
+        )
+        raw_runtime_headers = creds.get("extra_headers")
+        if isinstance(raw_runtime_headers, Mapping):
+            headers.update(
+                {
+                    str(key): str(value)
+                    for key, value in raw_runtime_headers.items()
+                    if value is not None
+                }
+            )
+
+    policy = {}
+    if headers:
+        policy["default_headers"] = headers
+    if tls.get("ssl_ca_cert"):
+        policy["ssl_ca_cert"] = tls["ssl_ca_cert"]
+    if "ssl_verify" in tls:
+        policy["ssl_verify"] = tls["ssl_verify"]
+    return _freeze_route_value(policy)
+
+
+def _resolve_delegation_route(
+    cfg: Dict[str, Any],
+    parent_agent,
+    *,
+    lane: Optional[str] = None,
+    config_snapshot: Optional[Dict[str, Any]] = None,
+) -> DelegationRoute:
+    """Resolve one immutable route snapshot from global config or a named lane."""
+    selected = dict(cfg)
+    lane_name: Optional[str] = None
+    if lane is not None:
+        if not isinstance(lane, str):
+            raise ValueError("Delegation lane must be a string")
+        lane_name = lane.strip()
+        if not lane_name:
+            raise ValueError("Delegation lane must be a non-empty name.")
+        lanes = cfg.get("lanes")
+        if not isinstance(lanes, dict):
+            raise ValueError(
+                "Delegation lanes config is malformed: delegation.lanes must be a mapping."
+            )
+        if lane_name not in lanes:
+            raise ValueError(f"Unknown delegation lane '{lane_name}'.")
+        lane_cfg = lanes[lane_name]
+        if not isinstance(lane_cfg, dict):
+            raise ValueError(
+                f"Delegation lane '{lane_name}' is malformed: expected a mapping."
+            )
+        allowed_lane_fields = {"enabled", "provider", "model", "reasoning_effort"}
+        unknown_fields = sorted(
+            set(lane_cfg) - allowed_lane_fields,
+            key=lambda field: (type(field).__name__, repr(field)),
+        )
+        if unknown_fields:
+            unknown_types = sorted({type(field).__name__ for field in unknown_fields})
+            raise ValueError(
+                f"Delegation lane '{lane_name}' is malformed: "
+                f"{len(unknown_fields)} unknown field(s) of type(s) {unknown_types}. "
+                f"Allowed fields are {sorted(allowed_lane_fields)}."
+            )
+        if "enabled" in lane_cfg and not isinstance(lane_cfg["enabled"], bool):
+            raise ValueError(
+                f"Delegation lane '{lane_name}' is malformed: enabled must be a boolean."
+            )
+        for field in ("provider", "model", "reasoning_effort"):
+            if field in lane_cfg and not isinstance(lane_cfg[field], str):
+                raise ValueError(
+                    f"Delegation lane '{lane_name}' is malformed: {field} must be a string."
+                )
+        if lane_cfg.get("reasoning_effort"):
+            from hermes_constants import parse_reasoning_effort
+
+            if parse_reasoning_effort(lane_cfg["reasoning_effort"]) is None:
+                raise ValueError(
+                    f"Delegation lane '{lane_name}' is malformed: "
+                    "reasoning_effort is invalid."
+                )
+        if not lane_cfg.get("enabled", True):
+            raise ValueError(f"Delegation lane '{lane_name}' is disabled.")
+        selected.update(lane_cfg)
+        # A provider lane is a distinct credential route. Do not let inherited
+        # direct-endpoint settings force it back to provider="custom" or leak a
+        # global endpoint credential onto the selected provider.
+        if str(lane_cfg.get("provider") or "").strip():
+            selected["base_url"] = ""
+            selected["api_key"] = ""
+            selected["api_mode"] = ""
+
+    if lane_name and config_snapshot is None:
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            loaded_config = load_config_readonly()
+            config_snapshot = copy.deepcopy(
+                dict(loaded_config) if isinstance(loaded_config, Mapping) else {}
+            )
+        except Exception:
+            # Named routes must not combine a credential resolved now with
+            # headers/TLS reloaded from a later config generation.
+            logger.debug("Could not snapshot named-route config", exc_info=True)
+            config_snapshot = {}
+
+    creds = _resolve_delegation_credentials(
+        selected,
+        parent_agent,
+        config_snapshot=config_snapshot,
+    )
+    inherit_parent_provider_routing = bool(
+        lane_name and not creds.get("provider") and not creds.get("base_url")
+    )
+    inherit_parent_transport = inherit_parent_provider_routing
+    if lane_name:
+        # Materialize every deferred legacy inheritance into the named route.
+        # Omitted-lane construction may read the parent later, but a lane must
+        # carry one complete snapshot shared by every child in the invocation.
+        creds = dict(creds)
+        parent_api_key = getattr(parent_agent, "api_key", None)
+        if not parent_api_key and hasattr(parent_agent, "_client_kwargs"):
+            parent_api_key = parent_agent._client_kwargs.get("api_key")
+        parent_model = getattr(parent_agent, "model", None)
+        parent_provider = getattr(parent_agent, "provider", None)
+        parent_base_url = getattr(parent_agent, "base_url", None)
+
+        if not creds.get("model") and isinstance(parent_model, str):
+            creds["model"] = parent_model
+        if creds.get("max_output_tokens") is None:
+            creds["max_output_tokens"] = getattr(parent_agent, "max_tokens", None)
+        # Direct endpoint resolution deliberately defers a missing key to the
+        # parent. Freeze that key now because lane construction cannot reread it.
+        if creds.get("base_url") and creds.get("api_key") is None:
+            creds["api_key"] = parent_api_key
+
+        if not creds.get("provider") and not creds.get("base_url"):
+            # No provider/endpoint override: snapshot the complete parent route.
+            creds.update({
+                "provider": (
+                    parent_provider if isinstance(parent_provider, str) else None
+                ),
+                "base_url": _inherit_parent_base_url(parent_agent, parent_base_url),
+                "api_key": parent_api_key,
+                "api_mode": getattr(parent_agent, "api_mode", None),
+                "request_overrides": copy.deepcopy(
+                    dict(getattr(parent_agent, "request_overrides", {}) or {})
+                ),
+                "command": getattr(parent_agent, "acp_command", None),
+                "args": copy.deepcopy(
+                    list(getattr(parent_agent, "acp_args", []) or [])
+                ),
+            })
+        if str(creds.get("provider") or "").strip().lower() == "bedrock":
+            if creds.get("bedrock_credentials") is None:
+                parent_bedrock_credentials = getattr(
+                    parent_agent, "_frozen_bedrock_credentials", None
+                )
+                if parent_bedrock_credentials is None:
+                    from agent.bedrock_adapter import capture_bedrock_credentials
+
+                    parent_bedrock_credentials = capture_bedrock_credentials()
+                creds["bedrock_credentials"] = parent_bedrock_credentials
+            if "bedrock_guardrail_config" not in creds:
+                parent_guardrail = getattr(
+                    parent_agent, "_bedrock_guardrail_config", None
+                )
+                creds["bedrock_guardrail_config"] = (
+                    copy.deepcopy(dict(parent_guardrail))
+                    if isinstance(parent_guardrail, Mapping)
+                    else {}
+                )
+        if str(creds.get("provider") or "").strip().lower() == "copilot-acp":
+            # Freeze the effective ACP subprocess route. Parent agents created
+            # from ambient ACP config store the resolved values on their live
+            # client, not necessarily on the public constructor attributes.
+            parent_client = getattr(parent_agent, "client", None)
+            if not creds.get("command"):
+                creds["command"] = getattr(parent_client, "_acp_command", None)
+            if creds.get("args") is None:
+                parent_client_args = getattr(parent_client, "_acp_args", None)
+                if parent_client_args is not None:
+                    creds["args"] = copy.deepcopy(list(parent_client_args))
+            if not creds.get("command") or creds.get("args") is None:
+                from agent.copilot_acp_client import _resolve_args, _resolve_command
+
+                if not creds.get("command"):
+                    creds["command"] = _resolve_command()
+                if creds.get("args") is None:
+                    creds["args"] = list(_resolve_args())
+    reasoning = getattr(parent_agent, "reasoning_config", None)
+    raw_effort = selected.get("reasoning_effort")
+    if raw_effort or raw_effort is False:
+        from hermes_constants import parse_reasoning_effort
+
+        parsed = parse_reasoning_effort(raw_effort)
+        if parsed is not None:
+            reasoning = parsed
+        else:
+            logger.warning(
+                "Unknown delegation%s reasoning_effort '%s', inheriting parent level",
+                f" lane '{lane_name}'" if lane_name else "",
+                raw_effort,
+            )
+
+    request_overrides = creds.get("request_overrides")
+    frozen_request_overrides = (
+        _freeze_route_value(request_overrides)
+        if isinstance(request_overrides, Mapping)
+        else None
+    )
+    if lane_name:
+        # ``None`` means "legacy caller did not provide an override" to
+        # _build_child_agent.  Named routes must instead snapshot the resolved
+        # absence of reasoning policy so every child bypasses config reloads.
+        frozen_reasoning = _freeze_route_value(
+            reasoning if isinstance(reasoning, Mapping) else {}
+        )
+    else:
+        frozen_reasoning = (
+            _freeze_route_value(reasoning)
+            if isinstance(reasoning, Mapping)
+            else None
+        )
+    provider_routing = None
+    http_policy = None
+    if lane_name:
+        if inherit_parent_provider_routing:
+            parent_providers_allowed = getattr(parent_agent, "providers_allowed", None)
+            parent_providers_ignored = getattr(parent_agent, "providers_ignored", None)
+            parent_providers_order = getattr(parent_agent, "providers_order", None)
+            parent_provider_sort = getattr(parent_agent, "provider_sort", None)
+            parent_provider_require_parameters = getattr(
+                parent_agent, "provider_require_parameters", False
+            )
+            parent_provider_data_collection = getattr(
+                parent_agent, "provider_data_collection", None
+            )
+            parent_min_coding_score = getattr(
+                parent_agent, "openrouter_min_coding_score", None
+            )
+            raw_provider_routing = {
+                "providers_allowed": (
+                    parent_providers_allowed
+                    if isinstance(parent_providers_allowed, (list, tuple))
+                    else None
+                ),
+                "providers_ignored": (
+                    parent_providers_ignored
+                    if isinstance(parent_providers_ignored, (list, tuple))
+                    else None
+                ),
+                "providers_order": (
+                    parent_providers_order
+                    if isinstance(parent_providers_order, (list, tuple))
+                    else None
+                ),
+                "provider_sort": (
+                    parent_provider_sort
+                    if isinstance(parent_provider_sort, str)
+                    else None
+                ),
+                "provider_require_parameters": (
+                    parent_provider_require_parameters
+                    if isinstance(parent_provider_require_parameters, bool)
+                    else False
+                ),
+                "provider_data_collection": (
+                    parent_provider_data_collection
+                    if isinstance(parent_provider_data_collection, str)
+                    else ""
+                ),
+                "openrouter_min_coding_score": (
+                    parent_min_coding_score
+                    if isinstance(parent_min_coding_score, (int, float))
+                    and not isinstance(parent_min_coding_score, bool)
+                    else None
+                ),
+            }
+        else:
+            # A configured provider or direct endpoint is a distinct trusted
+            # route. Parent OpenRouter policy belongs to the parent route and
+            # must not silently constrain or redirect the lane.
+            raw_provider_routing = {
+                "providers_allowed": None,
+                "providers_ignored": None,
+                "providers_order": None,
+                "provider_sort": None,
+                "provider_require_parameters": False,
+                "provider_data_collection": "",
+                "openrouter_min_coding_score": None,
+            }
+        provider_routing = _freeze_route_value(raw_provider_routing)
+        http_policy = _snapshot_named_route_http_policy(
+            creds,
+            parent_agent,
+            inherit_parent_transport=inherit_parent_transport,
+            config_snapshot=config_snapshot,
+        )
+    model = creds.get("model")
+    provider = creds.get("provider")
+    parent_model = getattr(parent_agent, "model", None)
+    parent_provider = getattr(parent_agent, "provider", None)
+    if lane_name is not None:
+        # Named routes expose one stable public identity across result,
+        # progress, hooks, repr, live logs, and recovery.  Empty/whitespace
+        # strings mean absence rather than a second spelling of None.
+        def _normalized_identity(value: Any) -> Optional[str]:
+            if not isinstance(value, str):
+                return None
+            normalized = value.strip()
+            return normalized or None
+
+        model = _normalized_identity(model)
+        provider = _normalized_identity(provider)
+        command = _normalized_identity(creds.get("command"))
+        raw_args = creds.get("args")
+        frozen_args = (
+            tuple(raw_args)
+            if isinstance(raw_args, (list, tuple))
+            else None
+        )
+        resolved_model = model or _normalized_identity(parent_model)
+        resolved_provider = provider or _normalized_identity(parent_provider)
+    else:
+        # Preserve the legacy omitted-lane route byte-for-byte.
+        command = creds.get("command")
+        frozen_args = (
+            tuple(creds["args"])
+            if creds.get("args") is not None
+            else None
+        )
+        resolved_model = model or (
+            parent_model if isinstance(parent_model, str) else None
+        )
+        resolved_provider = provider or (
+            parent_provider if isinstance(parent_provider, str) else None
+        )
+    route_api_key = creds.get("api_key")
+    if lane_name is not None and callable(route_api_key):
+        route_api_key = _RecordingCredentialProvider(route_api_key)
+
+    return DelegationRoute(
+        lane=lane_name,
+        model=model,
+        provider=provider,
+        base_url=creds.get("base_url"),
+        api_key=route_api_key,
+        api_mode=creds.get("api_mode"),
+        request_overrides=frozen_request_overrides,
+        provider_routing=provider_routing,
+        http_policy=http_policy,
+        bedrock_credentials=creds.get("bedrock_credentials"),
+        bedrock_guardrail=(
+            _freeze_route_value(creds.get("bedrock_guardrail_config") or {})
+            if lane_name is not None
+            else None
+        ),
+        max_output_tokens=creds.get("max_output_tokens"),
+        command=command,
+        args=frozen_args,
+        reasoning_config=frozen_reasoning,
+        resolved_model=resolved_model,
+        resolved_provider=resolved_provider,
+    )
+
+
+class _DelegationConfigSnapshot(dict):
+    """Delegation view retaining the complete config generation it came from."""
+
+    def __init__(self, delegation: Mapping[str, Any], full_config: Dict[str, Any]):
+        super().__init__(delegation)
+        self._full_config_snapshot = full_config
 
 
 def _load_config() -> dict:
@@ -3310,10 +4531,11 @@ def _load_config() -> dict:
         try:
             from hermes_cli.config import load_config_readonly
 
-            full = load_config_readonly()
+            loaded = load_config_readonly()
+            full = copy.deepcopy(dict(loaded) if isinstance(loaded, Mapping) else {})
             cfg = full.get("delegation") or {}
             if isinstance(cfg, dict):
-                return cfg
+                return _DelegationConfigSnapshot(cfg, full)
         except Exception:
             pass
     try:
@@ -3576,6 +4798,14 @@ DELEGATE_TASK_SCHEMA = {
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
             },
+            "lane": {
+                "type": "string",
+                "description": (
+                    "Optional trusted delegation lane configured under "
+                    "delegation.lanes in config.yaml. The lane selects the "
+                    "provider, model, and reasoning policy for this whole call."
+                ),
+            },
             "background": {
                 "type": "boolean",
                 "description": (
@@ -3647,6 +4877,7 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        lane=args.get("lane"),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
     ),

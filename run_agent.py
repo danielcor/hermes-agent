@@ -493,6 +493,9 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        frozen_http_policy: Optional[Dict[str, Any]] = None,
+        frozen_bedrock_credentials=None,
+        frozen_bedrock_guardrail: Optional[Dict[str, Any]] = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -546,6 +549,9 @@ class AIAgent:
             reasoning_config=reasoning_config,
             service_tier=service_tier,
             request_overrides=request_overrides,
+            frozen_http_policy=frozen_http_policy,
+            frozen_bedrock_credentials=frozen_bedrock_credentials,
+            frozen_bedrock_guardrail=frozen_bedrock_guardrail,
             prefill_messages=prefill_messages,
             platform=platform,
             user_id=user_id,
@@ -4019,7 +4025,11 @@ class AIAgent:
 
     def _client_log_context(self) -> str:
         provider = getattr(self, "provider", "unknown")
-        base_url = getattr(self, "base_url", "unknown")
+        base_url = (
+            "<frozen-route>"
+            if getattr(self, "_frozen_http_policy", None) is not None
+            else getattr(self, "base_url", "unknown")
+        )
         model = getattr(self, "model", "unknown")
         return (
             f"thread={self._thread_identity()} provider={provider} "
@@ -4275,7 +4285,13 @@ class AIAgent:
             base_url_host_matches(str(request_kwargs.get("base_url", "")), "githubcopilot.com")
             and self._api_kwargs_have_image_parts(api_kwargs or {})
         ):
-            request_kwargs["default_headers"] = self._copilot_headers_for_request(is_vision=True)
+            vision_headers = self._copilot_headers_for_request(is_vision=True)
+            headers = dict(vision_headers)
+            headers.update(request_kwargs.get("default_headers") or {})
+            headers["Copilot-Vision-Request"] = vision_headers[
+                "Copilot-Vision-Request"
+            ]
+            request_kwargs["default_headers"] = headers
         return self._create_openai_client(request_kwargs, reason=reason, shared=False)
 
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
@@ -4337,14 +4353,25 @@ class AIAgent:
         if getattr(self, "provider", None) == "bedrock":
             from agent.anthropic_adapter import build_anthropic_bedrock_client
             region = getattr(self, "_bedrock_region", "us-east-1") or "us-east-1"
-            client = build_anthropic_bedrock_client(region)
+            client = build_anthropic_bedrock_client(
+                region,
+                credential_snapshot=getattr(
+                    self, "_frozen_bedrock_credentials", None
+                ),
+            )
         else:
             from agent.anthropic_adapter import build_anthropic_client
+            anthropic_client_kwargs: Dict[str, Any] = {
+                "timeout": get_provider_request_timeout(self.provider, self.model),
+                "drop_context_1m_beta": _drop_1m,
+            }
+            frozen_http_policy = getattr(self, "_frozen_http_policy", None)
+            if frozen_http_policy is not None:
+                anthropic_client_kwargs["frozen_http_policy"] = frozen_http_policy
             client = build_anthropic_client(
                 self._anthropic_api_key,
                 getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
-                drop_context_1m_beta=_drop_1m,
+                **anthropic_client_kwargs,
             )
         logger.debug(
             "Anthropic request client created (%s, shared=False) provider=%s model=%s",
@@ -4421,8 +4448,14 @@ class AIAgent:
         from agent.codex_runtime import run_codex_create_stream_fallback
         return run_codex_create_stream_fallback(self, api_kwargs, client)
 
+    def _named_route_credentials_are_frozen(self) -> bool:
+        """Named delegation routes never reread ambient credential stores."""
+        return getattr(self, "_frozen_http_policy", None) is not None
+
     def _try_refresh_codex_client_credentials(self, *, force: bool = True) -> bool:
         if self.api_mode != "codex_responses" or self.provider not in {"openai-codex", "xai-oauth"}:
+            return False
+        if self._named_route_credentials_are_frozen():
             return False
 
         # Guard against silent account swap.
@@ -4484,6 +4517,13 @@ class AIAgent:
             return False
         if not isinstance(base_url, str) or not base_url.strip():
             return False
+        if not self._frozen_route_accepts_base_url(base_url):
+            logger.warning(
+                "%s credential refresh changed the endpoint for a frozen route; "
+                "rejecting refreshed credentials",
+                self.provider,
+            )
+            return False
 
         self.api_key = api_key.strip()
         self.base_url = base_url.strip().rstrip("/")
@@ -4502,6 +4542,8 @@ class AIAgent:
     ) -> bool:
         if self.api_mode != "chat_completions" or self.provider != "nous":
             return False
+        if self._named_route_credentials_are_frozen():
+            return False
 
         try:
             from hermes_cli.auth import resolve_nous_runtime_credentials
@@ -4519,6 +4561,12 @@ class AIAgent:
         if not isinstance(api_key, str) or not api_key.strip():
             return False
         if not isinstance(base_url, str) or not base_url.strip():
+            return False
+        if not self._frozen_route_accepts_base_url(base_url):
+            logger.warning(
+                "Nous credential refresh changed the endpoint for a frozen route; "
+                "rejecting refreshed credentials"
+            )
             return False
 
         self.api_key = api_key.strip()
@@ -4545,6 +4593,8 @@ class AIAgent:
         """
         if self.api_mode != "chat_completions" or self.provider != "vertex":
             return False
+        if self._named_route_credentials_are_frozen():
+            return False
 
         try:
             from agent.vertex_adapter import get_vertex_config
@@ -4557,6 +4607,12 @@ class AIAgent:
         if not isinstance(token, str) or not token.strip():
             return False
         if not isinstance(base_url, str) or not base_url.strip():
+            return False
+        if not self._frozen_route_accepts_base_url(base_url):
+            logger.warning(
+                "Vertex credential refresh changed the endpoint for a frozen route; "
+                "rejecting refreshed credentials"
+            )
             return False
 
         self.api_key = token.strip()
@@ -4579,6 +4635,8 @@ class AIAgent:
         a session restart.
         """
         if self.provider != "copilot":
+            return False
+        if self._named_route_credentials_are_frozen():
             return False
 
         try:
@@ -4612,6 +4670,8 @@ class AIAgent:
         # Other anthropic_messages providers (MiniMax, Alibaba, etc.) use their own keys.
         if self.provider != "anthropic":
             return False
+        if self._named_route_credentials_are_frozen():
+            return False
         # Azure endpoints use static API keys — OAuth token rotation doesn't apply.
         # Refreshing would pick up ~/.claude/.credentials.json OAuth token and break auth.
         _base = getattr(self, "_anthropic_base_url", "") or ""
@@ -4638,10 +4698,16 @@ class AIAgent:
             pass
 
         try:
+            anthropic_client_kwargs: Dict[str, Any] = {
+                "timeout": get_provider_request_timeout(self.provider, self.model)
+            }
+            frozen_http_policy = getattr(self, "_frozen_http_policy", None)
+            if frozen_http_policy is not None:
+                anthropic_client_kwargs["frozen_http_policy"] = frozen_http_policy
             self._anthropic_client = build_anthropic_client(
                 new_token,
                 getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                **anthropic_client_kwargs,
             )
         except Exception as exc:
             logger.warning("Failed to rebuild Anthropic client after credential refresh: %s", exc)
@@ -4656,7 +4722,42 @@ class AIAgent:
         self._is_anthropic_oauth = _is_oauth_token(new_token) if self.provider == "anthropic" else False
         return True
 
+    def _frozen_route_accepts_base_url(self, base_url: str) -> bool:
+        """Return whether refreshed credentials preserve a frozen route endpoint."""
+        if getattr(self, "_frozen_http_policy", None) is None:
+            return True
+        frozen_base = str(
+            getattr(self, "_frozen_http_base_url", "") or ""
+        ).rstrip("/")
+        return str(base_url or "").strip().rstrip("/") == frozen_base
+
     def _apply_client_headers_for_base_url(self, base_url: str) -> None:
+        frozen_policy = getattr(self, "_frozen_http_policy", None)
+        if frozen_policy is not None:
+            frozen_base = str(
+                getattr(self, "_frozen_http_base_url", "") or ""
+            ).rstrip("/")
+            if str(base_url or "").rstrip("/") != frozen_base:
+                # Never carry route-specific headers or TLS weakening to a
+                # different endpoint, and do not consult mutable provider
+                # profiles/config while handling the mismatch.
+                self._client_kwargs.pop("default_headers", None)
+                for policy_key in ("ssl_ca_cert", "ssl_verify"):
+                    self._client_kwargs.pop(policy_key, None)
+                return
+
+            frozen_headers = frozen_policy.get("default_headers")
+            if isinstance(frozen_headers, dict) and frozen_headers:
+                self._client_kwargs["default_headers"] = dict(frozen_headers)
+            else:
+                self._client_kwargs.pop("default_headers", None)
+            for policy_key in ("ssl_ca_cert", "ssl_verify"):
+                if policy_key in frozen_policy:
+                    self._client_kwargs[policy_key] = frozen_policy[policy_key]
+                else:
+                    self._client_kwargs.pop(policy_key, None)
+            return
+
         from agent.auxiliary_client import (
             build_nvidia_nim_headers,
             build_or_headers,
@@ -4748,6 +4849,12 @@ class AIAgent:
             self._client_kwargs["default_headers"] = merged
 
     def _swap_credential(self, entry) -> None:
+        if getattr(self, "_frozen_http_policy", None) is not None:
+            logger.warning(
+                "Ignoring credential swap for immutable named delegation route"
+            )
+            return
+
         runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
         runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
 
@@ -4761,9 +4868,15 @@ class AIAgent:
 
             self._anthropic_api_key = runtime_key
             self._anthropic_base_url = runtime_base
+            anthropic_client_kwargs: Dict[str, Any] = {
+                "timeout": get_provider_request_timeout(self.provider, self.model)
+            }
+            frozen_http_policy = getattr(self, "_frozen_http_policy", None)
+            if frozen_http_policy is not None:
+                anthropic_client_kwargs["frozen_http_policy"] = frozen_http_policy
             self._anthropic_client = build_anthropic_client(
                 runtime_key, runtime_base,
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                **anthropic_client_kwargs,
             )
             self._is_anthropic_oauth = _is_oauth_token(runtime_key) if self.provider == "anthropic" else False
             self.api_key = runtime_key
@@ -4829,14 +4942,25 @@ class AIAgent:
         if getattr(self, "provider", None) == "bedrock":
             from agent.anthropic_adapter import build_anthropic_bedrock_client
             region = getattr(self, "_bedrock_region", "us-east-1") or "us-east-1"
-            self._anthropic_client = build_anthropic_bedrock_client(region)
+            self._anthropic_client = build_anthropic_bedrock_client(
+                region,
+                credential_snapshot=getattr(
+                    self, "_frozen_bedrock_credentials", None
+                ),
+            )
         else:
             from agent.anthropic_adapter import build_anthropic_client
+            anthropic_client_kwargs: Dict[str, Any] = {
+                "timeout": get_provider_request_timeout(self.provider, self.model),
+                "drop_context_1m_beta": _drop_1m,
+            }
+            frozen_http_policy = getattr(self, "_frozen_http_policy", None)
+            if frozen_http_policy is not None:
+                anthropic_client_kwargs["frozen_http_policy"] = frozen_http_policy
             self._anthropic_client = build_anthropic_client(
                 self._anthropic_api_key,
                 getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
-                drop_context_1m_beta=_drop_1m,
+                **anthropic_client_kwargs,
             )
 
     def _interruptible_api_call(self, api_kwargs: dict):
@@ -6255,6 +6379,7 @@ class AIAgent:
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
+            lane=function_args.get("lane"),
             background=(not _is_subagent),
             parent_agent=self,
         )

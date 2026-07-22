@@ -63,4 +63,39 @@ describe('delegateTaskPayloads', () => {
 
     expect(spec).toMatchObject({ event_type: 'subagent.complete', status: 'failed' })
   })
+
+  it('preserves named route identity and qualified completion in compatibility events', () => {
+    const [spec] = delegateTaskPayloads(
+      payload({
+        name: 'delegate_task',
+        args: { goal: 'review it', lane: 'review' },
+        result: {
+          lane: 'review',
+          provider: 'anthropic',
+          model: 'claude-sonnet',
+          results: [
+            {
+              status: 'completed',
+              exit_reason: 'max_iterations',
+              lane: 'review',
+              provider: 'anthropic',
+              model: 'claude-sonnet',
+              summary: 'review failed'
+            }
+          ]
+        }
+      }),
+      'complete'
+    )
+
+    expect(spec).toMatchObject({
+      event_type: 'subagent.complete',
+      lane: 'review',
+      provider: 'anthropic',
+      model: 'claude-sonnet',
+      status: 'completed',
+      exit_reason: 'max_iterations',
+      summary: 'review failed'
+    })
+  })
 })

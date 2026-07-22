@@ -43,4 +43,42 @@ describe('spawnHistoryStore status normalization', () => {
 
     expect(status).toBe('completed')
   })
+
+  it('restores delegation route identity from disk snapshots', () => {
+    pushDiskSnapshot(
+      {
+        finished_at: 1_700_000_021,
+        label: 'route test',
+        session_id: 'sess-3',
+        started_at: 1_700_000_020,
+        subagents: [{
+          goal: 'review', id: 'sa-route', index: 0, lane: 'review',
+          model: 'grok-4.5', provider: 'xai-oauth', status: 'completed'
+        }]
+      },
+      '/tmp/snap-route.json'
+    )
+
+    expect(getSpawnHistory()[0]?.subagents[0]).toMatchObject({
+      lane: 'review', model: 'grok-4.5', provider: 'xai-oauth'
+    })
+  })
+
+  it('restores qualified completion exit reasons from disk snapshots', () => {
+    pushDiskSnapshot(
+      {
+        finished_at: 1_700_000_031,
+        label: 'exit reason test',
+        session_id: 'sess-4',
+        started_at: 1_700_000_030,
+        subagents: [{
+          exitReason: 'max_iterations', goal: 'review', id: 'sa-exit', index: 0,
+          status: 'completed'
+        }]
+      },
+      '/tmp/snap-exit-reason.json'
+    )
+
+    expect(getSpawnHistory()[0]?.subagents[0]?.exitReason).toBe('max_iterations')
+  })
 })

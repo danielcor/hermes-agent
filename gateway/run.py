@@ -69,6 +69,7 @@ _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
+_COMPLETION_CLAIM_HEARTBEAT_SECONDS = 60.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
@@ -16939,13 +16940,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             durable_delegation_id = str(evt.get("delegation_id") or "")
             if durable_delegation_id:
                 try:
-                    from tools.async_delegation import claim_completion_delivery
+                    from tools.async_delegation import (
+                        claim_completion_delivery,
+                        event_delivery_is_pending,
+                    )
 
                     durable_claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
                     if not claim_completion_delivery(
                         durable_delegation_id, durable_claim_id,
                     ):
-                        return None
+                        return False if event_delivery_is_pending(evt) else None
                 except Exception as exc:
                     logger.warning(
                         "Could not claim durable async completion %s: %s",
@@ -16962,11 +16966,72 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._completion_deliveries_inflight.add(identity)
 
         accepted = False
+        recorded_delivered = False
         try:
-            injection_result = await self._inject_watch_notification(synth_text, evt)
+            if durable_claim_id:
+                injection_task = asyncio.create_task(
+                    self._inject_watch_notification(synth_text, evt)
+                )
+                try:
+                    while True:
+                        done, _pending = await asyncio.wait(
+                            {injection_task},
+                            timeout=_COMPLETION_CLAIM_HEARTBEAT_SECONDS,
+                        )
+                        if injection_task in done:
+                            injection_result = await injection_task
+                            break
+                        try:
+                            from tools.async_delegation import renew_completion_delivery
+
+                            renewed = renew_completion_delivery(
+                                durable_delegation_id, durable_claim_id,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "Could not renew durable async completion %s: %s",
+                                durable_delegation_id, exc,
+                            )
+                            renewed = False
+                        if not renewed:
+                            injection_task.cancel()
+                            try:
+                                await injection_task
+                            except asyncio.CancelledError:
+                                pass
+                            return False
+                finally:
+                    if not injection_task.done():
+                        injection_task.cancel()
+                        try:
+                            await injection_task
+                        except asyncio.CancelledError:
+                            pass
+            else:
+                injection_result = await self._inject_watch_notification(synth_text, evt)
             if injection_result is not True:
                 return injection_result
             accepted = True
+
+            # If the durable async-delegation producer branch is present, its
+            # SQLite row remains the authoritative replay state. Acknowledge it
+            # after adapter acceptance; this gateway keeps no parallel ledger.
+            if durable_claim_id:
+                try:
+                    from tools.async_delegation import complete_completion_delivery
+
+                    acknowledged = complete_completion_delivery(
+                        durable_delegation_id, durable_claim_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Could not acknowledge durable async completion %s: %s",
+                        durable_delegation_id, exc,
+                    )
+                    acknowledged = False
+                if not acknowledged:
+                    accepted = False
+                    return False
 
             if identity is not None:
                 with self._completion_delivery_lock:
@@ -16977,25 +17042,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         > self._completion_delivery_retention
                     ):
                         self._completion_deliveries_delivered.popitem(last=False)
-
-            # If the durable async-delegation producer branch is present, its
-            # SQLite row remains the authoritative replay state. Acknowledge it
-            # after adapter acceptance; this gateway keeps no parallel ledger.
-            if durable_claim_id:
-                try:
-                    from tools.async_delegation import complete_completion_delivery
-
-                    complete_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Could not acknowledge durable async completion %s: %s",
-                        durable_delegation_id, exc,
-                    )
+                recorded_delivered = True
             return True
         finally:
-            if identity is not None and not accepted:
+            if identity is not None and not recorded_delivered:
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
             if durable_claim_id and not accepted:

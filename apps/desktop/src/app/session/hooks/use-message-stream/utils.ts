@@ -128,6 +128,32 @@ const firstString = (...candidates: unknown[]): string => {
   return ''
 }
 
+const delegationStatus = (
+  phase: 'running' | 'complete',
+  hasOuterError: boolean,
+  ...candidates: unknown[]
+): string => {
+  if (phase === 'running') {
+    return 'running'
+  }
+
+  const reported = firstString(...candidates).toLowerCase()
+
+  if (reported === 'interrupted' || reported === 'cancelled') {
+    return 'interrupted'
+  }
+
+  if (reported === 'failed' || reported === 'error' || reported === 'timeout') {
+    return 'failed'
+  }
+
+  if (reported === 'completed' || reported === 'success') {
+    return 'completed'
+  }
+
+  return hasOuterError ? 'failed' : 'completed'
+}
+
 export function delegateTaskPayloads(
   payload: GatewayEventPayload | undefined,
   phase: 'running' | 'complete',
@@ -141,7 +167,7 @@ export function delegateTaskPayloads(
   const result = parseMaybeRecord(payload.result)
   const rawTasks = Array.isArray(args.tasks) ? args.tasks : []
   const tasks = rawTasks.length ? rawTasks.map(parseMaybeRecord) : [args]
-  const status = phase === 'complete' ? (payload.error ? 'failed' : 'completed') : 'running'
+  const rawResults = Array.isArray(result.results) ? result.results : []
   const toolId = payload.tool_id || payload.tool_call_id || payload.id || 'delegate_task'
   const progressText = firstString(payload.preview, payload.message, payload.context)
 
@@ -153,13 +179,30 @@ export function delegateTaskPayloads(
         : 'subagent.progress'
 
   return tasks.map((task, index) => {
+    const taskResult = rawResults.length ? parseMaybeRecord(rawResults[index]) : result
     const goal = firstString(task.goal, args.goal, payload.context) || 'Delegated task'
-    const summary = firstString(result.summary, payload.summary, payload.message)
+    const summary = firstString(taskResult.summary, result.summary, payload.summary, payload.message)
+
+    const status = delegationStatus(
+      phase,
+      Boolean(payload.error),
+      taskResult.status,
+      result.status
+    )
+
+    const lane = firstString(taskResult.lane, result.lane, args.lane)
+    const provider = firstString(taskResult.provider, result.provider, args.provider)
+    const model = firstString(taskResult.model, result.model, args.model)
+    const exitReason = firstString(taskResult.exit_reason, result.exit_reason)
 
     return {
       depth: 0,
-      duration_seconds: payload.duration_s,
+      duration_seconds: taskResult.duration_seconds ?? payload.duration_s,
+      exit_reason: exitReason || undefined,
       goal,
+      lane: lane || undefined,
+      model: model || undefined,
+      provider: provider || undefined,
       status,
       subagent_id: `delegate-tool:${toolId}:${index}`,
       summary: summary || undefined,
@@ -172,7 +215,7 @@ export function delegateTaskPayloads(
       event_type: eventType,
       output_tail:
         phase === 'complete' && summary
-          ? [{ is_error: Boolean(payload.error), preview: summary, tool: 'delegate_task' }]
+          ? [{ is_error: status !== 'completed', preview: summary, tool: 'delegate_task' }]
           : undefined
     }
   })

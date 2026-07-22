@@ -277,7 +277,9 @@ class LiveTranscriptWriter:
         self.marker(" ".join(parts))
 
 
-def wrap_progress_callback(inner_cb, writer: LiveTranscriptWriter):
+def wrap_progress_callback(
+    inner_cb, writer: LiveTranscriptWriter, *, public_sanitizer=None
+):
     """Wrap a child's tool_progress_callback so events also land in the log.
 
     ``inner_cb`` may be None (no parent display) — the wrapper still records.
@@ -287,11 +289,17 @@ def wrap_progress_callback(inner_cb, writer: LiveTranscriptWriter):
     """
 
     def _cb(event_type, tool_name=None, preview=None, args=None, **kwargs):
+        if public_sanitizer is not None:
+            event_type, tool_name, preview, args, kwargs = public_sanitizer(
+                (event_type, tool_name, preview, args, kwargs)
+            )
         try:
             writer.observe(event_type, tool_name, preview, args, **kwargs)
         except Exception as exc:  # noqa: BLE001 — must never hit the agent loop
-            logger.debug("Live transcript observe failed: %s", exc)
+            logger.debug("Live transcript observe failed (%s)", type(exc).__name__)
         if inner_cb is not None:
+            if public_sanitizer is not None:
+                kwargs["_delegation_route_sanitized"] = True
             inner_cb(event_type, tool_name, preview, args, **kwargs)
 
     def _flush():
@@ -313,6 +321,10 @@ def create_live_transcripts(
     task_list: List[Dict[str, Any]],
     context: Optional[str] = None,
     delegation_id: Optional[str] = None,
+    *,
+    lane: Optional[str] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> tuple[Optional[str], List[Optional[LiveTranscriptWriter]], List[str]]:
     """Create one pre-headered writer per task + a manifest.json.
 
@@ -339,7 +351,14 @@ def create_live_transcripts(
                 paths.append(str(w.path))
         if not paths:
             return None, [None] * n, []
-        _write_manifest(deleg_id, task_list, paths)
+        _write_manifest(
+            deleg_id,
+            task_list,
+            paths,
+            lane=lane,
+            provider=provider,
+            model=model,
+        )
         return deleg_id, writers, paths
     except Exception as exc:
         logger.debug("Live transcript creation failed: %s", exc)
@@ -350,13 +369,23 @@ def _manifest_path(delegation_id: str) -> Path:
     return live_transcript_root() / delegation_id / "manifest.json"
 
 
-def _write_manifest(delegation_id: str, task_list: List[Dict[str, Any]],
-                    paths: List[str]) -> None:
+def _write_manifest(
+    delegation_id: str,
+    task_list: List[Dict[str, Any]],
+    paths: List[str],
+    *,
+    lane: Optional[str] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+) -> None:
     try:
         manifest = {
             "delegation_id": delegation_id,
             "started": time.strftime("%Y-%m-%d %H:%M:%S"),
             "task_count": len(task_list),
+            "lane": lane,
+            "provider": provider,
+            "model": model,
             "tasks": [
                 {
                     "index": i,
@@ -367,6 +396,9 @@ def _write_manifest(delegation_id: str, task_list: List[Dict[str, Any]],
                     # credential exposed one file over.
                     "goal": _redact(str(t.get("goal", ""))[:500]),
                     "log": paths[i] if i < len(paths) else None,
+                    "lane": lane,
+                    "provider": provider,
+                    "model": model,
                     "status": "running",
                 }
                 for i, t in enumerate(task_list)

@@ -4183,8 +4183,12 @@ def _on_tool_progress(
             payload["child_session_id"] = str(_kwargs["child_session_id"])
         if _kwargs.get("depth") is not None:
             payload["depth"] = int(_kwargs["depth"])
+        if _kwargs.get("lane"):
+            payload["lane"] = str(_kwargs["lane"])
         if _kwargs.get("model"):
             payload["model"] = str(_kwargs["model"])
+        if _kwargs.get("provider"):
+            payload["provider"] = str(_kwargs["provider"])
         if _kwargs.get("tool_count") is not None:
             payload["tool_count"] = int(_kwargs["tool_count"])
         if _kwargs.get("toolsets"):
@@ -4214,6 +4218,8 @@ def _on_tool_progress(
             payload["text"] = str(preview)
         if _kwargs.get("status"):
             payload["status"] = str(_kwargs["status"])
+        if _kwargs.get("exit_reason"):
+            payload["exit_reason"] = str(_kwargs["exit_reason"])
         if _kwargs.get("summary"):
             payload["summary"] = str(_kwargs["summary"])
         if _kwargs.get("duration_seconds") is not None:
@@ -9761,10 +9767,18 @@ def _notification_poller_loop(
 
         rid = f"__notif__{int(time.time() * 1000)}"
         from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
+            claim_event_delivery,
+            complete_event_delivery,
+            event_delivery_is_pending,
+            release_event_delivery,
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            with session["history_lock"]:
+                session["running"] = False
+            if event_delivery_is_pending(evt):
+                process_registry.completion_queue.put(evt)
+                time.sleep(0.25)
             continue
         try:
             _emit("message.start", sid)
@@ -9829,10 +9843,17 @@ def _notification_poller_loop(
 
         rid = f"__notif__{int(time.time() * 1000)}"
         from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
+            claim_event_delivery,
+            complete_event_delivery,
+            event_delivery_is_pending,
+            release_event_delivery,
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            with session["history_lock"]:
+                session["running"] = False
+            if event_delivery_is_pending(evt):
+                deferred.append(evt)
             continue
         try:
             _emit("message.start", sid)
@@ -10453,10 +10474,17 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                         break
                     session["running"] = True
                 from tools.async_delegation import (
-                    claim_event_delivery, complete_event_delivery, release_event_delivery,
+                    claim_event_delivery,
+                    complete_event_delivery,
+                    event_delivery_is_pending,
+                    release_event_delivery,
                 )
                 _claim = claim_event_delivery(_evt, "tui-post-turn")
                 if _claim is None:
+                    with session["history_lock"]:
+                        session["running"] = False
+                    if event_delivery_is_pending(_evt):
+                        process_registry.completion_queue.put(_evt)
                     continue
                 try:
                     _emit("message.start", sid)

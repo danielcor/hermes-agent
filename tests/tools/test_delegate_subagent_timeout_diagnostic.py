@@ -129,7 +129,9 @@ class TestDumpSubagentTimeoutDiagnostic:
         # Child config
         assert "model: 'test/model'" in content
         assert "provider: 'testprov'" in content
-        assert "base_url: 'https://example.test/v1'" in content
+        assert "https://example.test/v1" not in content
+        assert "base_url:" not in content
+        assert "api_mode:" not in content
         assert "max_iterations: 30" in content
         # Toolsets
         assert "enabled_toolsets:  ['web', 'terminal']" in content
@@ -165,6 +167,50 @@ class TestDumpSubagentTimeoutDiagnostic:
         # Goal section trimmed to 1000 chars + suffix
         goal_block = content.split("## Goal", 1)[1].split("## Child config", 1)[0]
         assert len(goal_block) < 1200
+
+    def test_redacts_named_route_secrets_before_writing(self, hermes_home):
+        from tools.delegate_tool import (
+            DelegationRoute,
+            _dump_subagent_timeout_diagnostic,
+            _route_publication_sanitizer,
+        )
+
+        secret = "route-secret-timeout-diagnostic"
+        child = _StubChild()
+        setattr(child, "_delegate_public_sanitizer", _route_publication_sanitizer(
+            DelegationRoute(
+                lane="review",
+                model="model",
+                provider="custom",
+                base_url="https://route.invalid/v1",
+                api_key=secret,
+                api_mode="chat_completions",
+                request_overrides=None,
+                provider_routing=None,
+                http_policy=None,
+                max_output_tokens=None,
+                command=None,
+                args=None,
+                reasoning_config=None,
+                resolved_model="model",
+                resolved_provider="custom",
+            )
+        ))
+        child.get_activity_summary = lambda: {"current_tool": f"using {secret}"}
+
+        path = _dump_subagent_timeout_diagnostic(
+            child=child,
+            task_index=0,
+            timeout_seconds=300.0,
+            duration_seconds=300.0,
+            worker_thread=None,
+            goal=f"inspect {secret}",
+        )
+
+        assert path is not None
+        content = Path(path).read_text()
+        assert secret not in content
+        assert "[REDACTED ROUTE VALUE]" in content
 
     def test_missing_worker_thread_is_handled(self, hermes_home):
         from tools.delegate_tool import _dump_subagent_timeout_diagnostic
@@ -254,7 +300,8 @@ class TestRunSingleChildTimeoutDump:
         child = _StubChild(api_call_count=0, hang_seconds=10.0)
         result = self._invoke_with_short_timeout(child, monkeypatch)
 
-        assert result["status"] == "timeout"
+        assert result["status"] == "failed"
+        assert result["exit_reason"] == "timeout"
         assert result["api_calls"] == 0
         assert result["diagnostic_path"] is not None
         dump_path = Path(result["diagnostic_path"])
@@ -270,7 +317,8 @@ class TestRunSingleChildTimeoutDump:
         child = _StubChild(api_call_count=5, hang_seconds=10.0)
         result = self._invoke_with_short_timeout(child, monkeypatch)
 
-        assert result["status"] == "timeout"
+        assert result["status"] == "failed"
+        assert result["exit_reason"] == "timeout"
         assert result["api_calls"] == 5
         # No diagnostic file should be written for timeouts that made
         # actual API calls — the old generic "stuck on slow call" message

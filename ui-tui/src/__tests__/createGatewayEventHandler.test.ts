@@ -1014,6 +1014,31 @@ describe('createGatewayEventHandler', () => {
     expect(getTurnState().subagents.find(s => s.id === 'sa-error')?.status).toBe('error')
   })
 
+  it('preserves a qualified completion exit reason', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({
+      payload: { goal: 'bounded child', subagent_id: 'sa-bounded', task_index: 0 },
+      type: 'subagent.start'
+    } as any)
+    onEvent({
+      payload: {
+        exit_reason: 'max_iterations',
+        goal: 'bounded child',
+        status: 'completed',
+        subagent_id: 'sa-bounded',
+        task_index: 0
+      },
+      type: 'subagent.complete'
+    } as any)
+
+    expect(getTurnState().subagents.find(s => s.id === 'sa-bounded')).toMatchObject({
+      exitReason: 'max_iterations',
+      status: 'completed'
+    })
+  })
+
   it('normalizes unknown subagent.complete statuses to completed', () => {
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))
@@ -1030,6 +1055,27 @@ describe('createGatewayEventHandler', () => {
     expect(getTurnState().subagents.find(s => s.id === 'sa-weird')?.status).toBe('completed')
   })
 
+  it('preserves delegation route identity across partial subagent events', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({
+      payload: {
+        goal: 'review', lane: 'review', model: 'grok-4.5', provider: 'xai-oauth',
+        subagent_id: 'sa-route', task_index: 0
+      },
+      type: 'subagent.start'
+    } as any)
+    onEvent({
+      payload: { goal: 'review', subagent_id: 'sa-route', task_index: 0, tool_name: 'read_file' },
+      type: 'subagent.tool'
+    } as any)
+
+    expect(getTurnState().subagents.find(s => s.id === 'sa-route')).toMatchObject({
+      lane: 'review', model: 'grok-4.5', provider: 'xai-oauth'
+    })
+  })
+
   it('nudges toward /agents on the first spawn_requested of a turn', () => {
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))
@@ -1044,12 +1090,11 @@ describe('createGatewayEventHandler', () => {
     expect(hints[0]).toMatchObject({ tone: 'info' })
   })
 
-  it('nudges toward /agents on subagent.start (spawn_requested dropped in CLI path)', () => {
+  it('nudges toward /agents on subagent.start when spawn_requested is unavailable', () => {
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))
 
-    // In the real CLI→gateway path the delegate callback drops
-    // spawn_requested, so `start` is the first event the TUI sees.
+    // Compatibility with older emitters where `start` is the first event.
     onEvent({
       payload: { goal: 'child a', subagent_id: 'sa-a', task_index: 0 },
       type: 'subagent.start'

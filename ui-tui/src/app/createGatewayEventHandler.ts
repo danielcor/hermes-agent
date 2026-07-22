@@ -934,6 +934,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           ev.payload,
           c => ({
             durationSeconds: ev.payload.duration_seconds ?? c.durationSeconds,
+            exitReason: ev.payload.exit_reason ?? c.exitReason,
             status: normalizeSubagentStatus(ev.payload.status, 'completed'),
             summary: ev.payload.summary || ev.payload.text || c.summary
           }),

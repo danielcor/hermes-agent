@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import re
+import threading
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -86,6 +87,82 @@ def _require_boto3():
             f"pip install --upgrade boto3"
         )
     return boto3
+
+
+class BedrockCredentialSnapshot:
+    """One initialized AWS credential chain for an immutable named route."""
+
+    def __init__(self, session, credentials=None, bearer_token: str = ""):
+        self._session = session
+        self._credentials = credentials
+        self._recorded_secrets: set[str] = {bearer_token} if bearer_token else set()
+        self._lock = threading.Lock()
+
+    def _frozen_credentials(self):
+        if self._credentials is None:
+            return None
+        frozen = self._credentials.get_frozen_credentials()
+        with self._lock:
+            for value in (
+                getattr(frozen, "access_key", None),
+                getattr(frozen, "secret_key", None),
+                getattr(frozen, "token", None),
+            ):
+                if isinstance(value, str) and value:
+                    self._recorded_secrets.add(value)
+        return frozen
+
+    def runtime_client(self, region: str):
+        # Force the captured provider chain to issue credentials before client
+        # construction so those values are known to the route redactor.
+        self._frozen_credentials()
+        return self._session.client("bedrock-runtime", region_name=region)
+
+    def anthropic_client_kwargs(self) -> Dict[str, str]:
+        frozen = self._frozen_credentials()
+        if frozen is None:
+            raise RuntimeError("AnthropicBedrock requires SigV4 credentials")
+        kwargs = {
+            "aws_access_key": getattr(frozen, "access_key", None),
+            "aws_secret_key": getattr(frozen, "secret_key", None),
+            "aws_session_token": getattr(frozen, "token", None),
+        }
+        return {key: value for key, value in kwargs.items() if value}
+
+    def publication_secrets(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(self._recorded_secrets)
+
+
+def capture_bedrock_credentials() -> BedrockCredentialSnapshot:
+    """Capture the currently selected boto3 credential-provider generation."""
+    boto3 = _require_boto3()
+    bearer_token = os.environ.get("AWS_BEARER_TOKEN_BEDROCK", "").strip()
+    if bearer_token:
+        import botocore.session
+        from botocore.tokens import FrozenAuthToken, TokenProviderChain
+
+        class _StaticBearerProvider:
+            METHOD = "frozen-env"
+
+            def load_token(self, **_kwargs):
+                return FrozenAuthToken(bearer_token)
+
+        botocore_session = botocore.session.get_session()
+        botocore_session.register_component(
+            "token_provider", TokenProviderChain([_StaticBearerProvider()])
+        )
+        session = boto3.Session(botocore_session=botocore_session)
+        return BedrockCredentialSnapshot(session, bearer_token=bearer_token)
+
+    session = boto3.Session()
+    credentials = session.get_credentials()
+    if credentials is None:
+        raise RuntimeError("AWS credential provider chain returned no credentials")
+    # Force lazy profile/environment/provider-chain selection now, before a
+    # named route can observe later ambient mutations.
+    credentials.get_frozen_credentials()
+    return BedrockCredentialSnapshot(session, credentials)
 
 
 def _get_bedrock_runtime_client(region: str):

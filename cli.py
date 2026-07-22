@@ -544,6 +544,7 @@ def load_cli_config() -> Dict[str, Any]:
             "provider": "",    # Subagent provider override (empty = inherit parent provider)
             "base_url": "",    # Direct OpenAI-compatible endpoint for subagents
             "api_key": "",     # API key for delegation.base_url (falls back to OPENAI_API_KEY)
+            "lanes": {},        # Trusted named delegation route overlays
         },
         "onboarding": {
             # First-touch hint flags (see agent/onboarding.py).  Each hint is
@@ -9437,6 +9438,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         from tools.async_delegation import (
             claim_event_delivery,
             complete_event_delivery,
+            event_delivery_is_pending,
         )
 
         session_key = getattr(self, "session_id", "") or ""
@@ -9446,6 +9448,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         ):
             claim = claim_event_delivery(event, consumer)
             if claim is None:
+                if event_delivery_is_pending(event):
+                    process_registry.completion_queue.put(event)
                 continue
             self._pending_input.put(synthetic_message)
             complete_event_delivery(event, claim)

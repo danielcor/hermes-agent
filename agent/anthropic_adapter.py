@@ -22,7 +22,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from hermes_constants import get_hermes_home
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 from utils import base_url_host_matches, normalize_proxy_env_vars
 
 # NOTE: `import anthropic` is deliberately NOT at module top — the SDK pulls
@@ -654,6 +654,7 @@ def _build_anthropic_client_with_bearer_hook(
     timeout: float = None,
     *,
     drop_context_1m_beta: bool = False,
+    frozen_http_policy: Optional[Mapping[str, Any]] = None,
 ):
     """Anthropic-on-Foundry Entra ID variant of :func:`build_anthropic_client`.
 
@@ -692,7 +693,17 @@ def _build_anthropic_client_with_bearer_hook(
         import re as _re
         normalized_base_url = _re.sub(r"/v1/?$", "", normalized_base_url.rstrip("/"))
 
-    http_client = build_bearer_http_client(token_provider, timeout=timeout_obj)
+    http_client_kwargs: Dict[str, Any] = {"timeout": timeout_obj}
+    if frozen_http_policy and any(
+        key in frozen_http_policy for key in ("ssl_ca_cert", "ssl_verify")
+    ):
+        from agent.ssl_verify import resolve_httpx_verify
+
+        http_client_kwargs["verify"] = resolve_httpx_verify(
+            ca_bundle=frozen_http_policy.get("ssl_ca_cert"),
+            ssl_verify=frozen_http_policy.get("ssl_verify"),
+        )
+    http_client = build_bearer_http_client(token_provider, **http_client_kwargs)
 
     kwargs = {
         "timeout": timeout_obj,
@@ -721,6 +732,15 @@ def _build_anthropic_client_with_bearer_hook(
     if common_betas:
         kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
 
+    frozen_headers = (
+        frozen_http_policy.get("default_headers") if frozen_http_policy else None
+    )
+    if isinstance(frozen_headers, Mapping):
+        kwargs["default_headers"] = {
+            **dict(kwargs.get("default_headers") or {}),
+            **dict(frozen_headers),
+        }
+
     return _anthropic_sdk.Anthropic(**kwargs)
 
 
@@ -730,6 +750,7 @@ def build_anthropic_client(
     timeout: float = None,
     *,
     drop_context_1m_beta: bool = False,
+    frozen_http_policy: Optional[Mapping[str, Any]] = None,
 ):
     """Create an Anthropic client, auto-detecting setup-tokens vs API keys.
 
@@ -771,6 +792,7 @@ def build_anthropic_client(
         return _build_anthropic_client_with_bearer_hook(
             api_key, base_url, timeout,
             drop_context_1m_beta=drop_context_1m_beta,
+            frozen_http_policy=frozen_http_policy,
         )
 
     normalize_proxy_env_vars()
@@ -850,10 +872,32 @@ def build_anthropic_client(
         if common_betas:
             kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
 
+    frozen_headers = (
+        frozen_http_policy.get("default_headers") if frozen_http_policy else None
+    )
+    if isinstance(frozen_headers, Mapping):
+        kwargs["default_headers"] = {
+            **dict(kwargs.get("default_headers") or {}),
+            **dict(frozen_headers),
+        }
+    if frozen_http_policy and any(
+        key in frozen_http_policy for key in ("ssl_ca_cert", "ssl_verify")
+    ):
+        from httpx import Client
+        from agent.ssl_verify import resolve_httpx_verify
+
+        kwargs["http_client"] = Client(
+            timeout=kwargs["timeout"],
+            verify=resolve_httpx_verify(
+                ca_bundle=frozen_http_policy.get("ssl_ca_cert"),
+                ssl_verify=frozen_http_policy.get("ssl_verify"),
+            ),
+        )
+
     return _anthropic_sdk.Anthropic(**kwargs)
 
 
-def build_anthropic_bedrock_client(region: str):
+def build_anthropic_bedrock_client(region: str, *, credential_snapshot=None):
     """Create an AnthropicBedrock client for Bedrock Claude models.
 
     Uses the Anthropic SDK's native Bedrock adapter, which provides full
@@ -882,6 +926,11 @@ def build_anthropic_bedrock_client(region: str):
         )
     from httpx import Timeout
 
+    credential_kwargs = (
+        credential_snapshot.anthropic_client_kwargs()
+        if credential_snapshot is not None
+        else {}
+    )
     return _anthropic_sdk.AnthropicBedrock(
         aws_region=region,
         timeout=Timeout(timeout=900.0, connect=10.0),
@@ -889,6 +938,7 @@ def build_anthropic_bedrock_client(region: str):
         # default max_retries=2 ignores it and double-retries. (#26293)
         max_retries=0,
         default_headers={"anthropic-beta": ",".join([*_COMMON_BETAS, _CONTEXT_1M_BETA])},
+        **credential_kwargs,
     )
 
 

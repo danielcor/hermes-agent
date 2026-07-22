@@ -1950,6 +1950,33 @@ class TestBedrockIamStreamingFallback:
         assert response.choices[0].message.content == "hi"
         assert getattr(agent, "_disable_streaming", False) is True
 
+    def test_named_route_stream_uses_frozen_bedrock_credentials(self):
+        agent = self._make_bedrock_agent()
+        frozen_client = MagicMock()
+        frozen_client.converse_stream.return_value = {"stream": []}
+        ambient_client = MagicMock()
+        ambient_client.converse_stream.return_value = {"stream": []}
+        snapshot = MagicMock()
+        snapshot.runtime_client.return_value = frozen_client
+        agent._frozen_bedrock_credentials = snapshot
+
+        with patch(
+            "agent.bedrock_adapter._get_bedrock_runtime_client",
+            return_value=ambient_client,
+        ):
+            agent._interruptible_streaming_api_call(
+                {
+                    "__bedrock_region__": "us-west-2",
+                    "__bedrock_converse__": True,
+                    "modelId": agent.model,
+                    "messages": [],
+                }
+            )
+
+        snapshot.runtime_client.assert_called_once_with("us-west-2")
+        frozen_client.converse_stream.assert_called_once()
+        ambient_client.converse_stream.assert_not_called()
+
     def test_other_bedrock_errors_still_propagate(self):
         pytest.importorskip("botocore", reason="botocore required for Bedrock tests")
         from botocore.exceptions import ClientError

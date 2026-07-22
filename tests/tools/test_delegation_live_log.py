@@ -240,6 +240,25 @@ def test_create_live_transcripts_precreates_paths_and_manifest():
     assert "ctx B" in Path(paths[1]).read_text(encoding="utf-8")
 
 
+def test_manifest_records_resolved_delegation_route():
+    deleg_id, _writers, _paths = create_live_transcripts(
+        [{"goal": "review"}],
+        lane="review",
+        provider="xai-oauth",
+        model="grok-4.5",
+    )
+
+    manifest = json.loads(
+        (live_transcript_root() / deleg_id / "manifest.json").read_text()
+    )
+    assert manifest["lane"] == "review"
+    assert manifest["provider"] == "xai-oauth"
+    assert manifest["model"] == "grok-4.5"
+    assert manifest["tasks"][0]["lane"] == "review"
+    assert manifest["tasks"][0]["provider"] == "xai-oauth"
+    assert manifest["tasks"][0]["model"] == "grok-4.5"
+
+
 def test_update_manifest_statuses():
     tasks = [{"goal": "a"}, {"goal": "b"}]
     deleg_id, _writers, _paths = create_live_transcripts(tasks)

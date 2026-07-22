@@ -413,13 +413,18 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         )
         region = api_kwargs.pop("__bedrock_region__", "us-east-1")
         api_kwargs.pop("__bedrock_converse__", None)
-        client = _get_bedrock_runtime_client(region)
+        frozen_credentials = getattr(agent, "_frozen_bedrock_credentials", None)
+        client = (
+            frozen_credentials.runtime_client(region)
+            if frozen_credentials is not None
+            else _get_bedrock_runtime_client(region)
+        )
         try:
             raw_response = client.converse(**api_kwargs)
         except Exception as _bedrock_exc:
             # Evict the cached client on stale-connection failures
             # so the outer retry loop builds a fresh client/pool.
-            if is_stale_connection_error(_bedrock_exc):
+            if is_stale_connection_error(_bedrock_exc) and frozen_credentials is None:
                 invalidate_runtime_client(region)
             raise
         return normalize_converse_response(raw_response)
@@ -2316,7 +2321,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 )
                 region = api_kwargs.pop("__bedrock_region__", "us-east-1")
                 api_kwargs.pop("__bedrock_converse__", None)
-                client = _get_bedrock_runtime_client(region)
+                frozen_bedrock = getattr(agent, "_frozen_bedrock_credentials", None)
+                client = (
+                    frozen_bedrock.runtime_client(region)
+                    if frozen_bedrock is not None
+                    else _get_bedrock_runtime_client(region)
+                )
                 try:
                     raw_response = client.converse_stream(**api_kwargs)
                 except Exception as _bedrock_exc:

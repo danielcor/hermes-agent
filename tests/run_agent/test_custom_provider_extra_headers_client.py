@@ -117,3 +117,46 @@ def test_extra_headers_merge_with_global_default_headers(mock_openai):
     assert headers["User-Agent"] == "hermes-proxy"  # per-provider wins
     assert headers["X-Global"] == "1"
     assert headers["X-Local"] == "2"
+
+
+@patch("run_agent.OpenAI")
+def test_frozen_http_policy_bypasses_mutable_config_resolution(mock_openai):
+    mock_openai.return_value = MagicMock()
+    frozen = {
+        "default_headers": {"Authorization": "frozen", "X-Lane": "review"},
+        "ssl_ca_cert": "/frozen/lane-ca.pem",
+        "ssl_verify": False,
+    }
+    with patch.object(AIAgent, "_apply_user_default_headers") as user_headers, patch(
+        "hermes_cli.config.apply_custom_provider_tls_to_client_kwargs"
+    ) as apply_tls, patch(
+        "hermes_cli.config.apply_custom_provider_extra_headers_to_client_kwargs"
+    ) as apply_headers:
+        agent = AIAgent(
+            api_key="proxy-key",
+            base_url=_PROXY_URL,
+            model="my-model",
+            provider="custom",
+            frozen_http_policy=frozen,
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        assert _PROXY_URL not in agent._client_log_context()
+        assert "base_url=<frozen-route>" in agent._client_log_context()
+        client_kwargs = getattr(agent, "_client_kwargs")
+        assert client_kwargs["default_headers"]["Authorization"] == "frozen"
+        client_kwargs.pop("default_headers", None)
+        agent._apply_client_headers_for_base_url(_PROXY_URL)
+        assert client_kwargs["default_headers"]["Authorization"] == "frozen"
+        assert client_kwargs["default_headers"]["X-Lane"] == "review"
+        assert client_kwargs["ssl_ca_cert"] == "/frozen/lane-ca.pem"
+        assert client_kwargs["ssl_verify"] is False
+        agent._apply_client_headers_for_base_url("https://unexpected.invalid/v1")
+        assert "Authorization" not in (client_kwargs.get("default_headers") or {})
+        assert "ssl_ca_cert" not in client_kwargs
+        assert "ssl_verify" not in client_kwargs
+
+    user_headers.assert_not_called()
+    apply_tls.assert_not_called()
+    apply_headers.assert_not_called()

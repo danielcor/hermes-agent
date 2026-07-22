@@ -136,9 +136,10 @@ the synthetic turn acknowledges delivery; failed attempts release the claim for
 retry.
 
 This does not resume child execution after a crash. A delegation whose owner
-process disappears while it is still running is recorded as `unknown`, because
-Hermes cannot prove whether its external side effects happened. Pending and
-delivered records are bounded and profile-local.
+process disappears while it is still running is published with
+`status="failed"` and `exit_reason="owner_exit"`; Hermes cannot prove whether
+its external side effects happened. Pending and delivered records are bounded
+and profile-local.
 
 ## Model Override
 
@@ -152,6 +153,47 @@ delegation:
 ```
 
 If omitted, subagents use the same model as the parent.
+
+## Named Delegation Lanes
+
+Named lanes let trusted configuration choose different provider/model/reasoning
+routes per delegation call without exposing credentials, endpoints, or arbitrary
+provider settings to the model. Configure symbolic names under
+`delegation.lanes`, then pass only the name to `delegate_task`:
+
+```yaml
+# In ~/.hermes/config.yaml
+delegation:
+  lanes:
+    review:
+      provider: xai-oauth
+      model: grok-4.5
+      reasoning_effort: high
+    apply:
+      provider: openai-codex
+      model: gpt-5.6-sol
+      reasoning_effort: high
+```
+
+```python
+delegate_task(goal="Review the branch for correctness", lane="review")
+delegate_task(goal="Apply the approved fixes", lane="apply")
+```
+
+A lane applies to the whole single-task or batch invocation. Hermes resolves it
+once before creating any child, so every task in a batch receives the same
+immutable route. Lane names are trimmed and matched exactly (case-sensitive).
+Unknown, malformed, empty, or explicitly disabled lanes fail before child,
+transcript, or asynchronous-dispatch records are created. A configured lane is
+enabled by default; use `enabled: false` to disable it.
+
+Lane definitions may contain only `enabled`, `provider`, `model`, and
+`reasoning_effort`. Unspecified values inherit from the global `delegation`
+route. When a lane sets `provider`, inherited direct-endpoint fields are cleared
+so a global `base_url` or `api_key` cannot silently override that provider.
+Credentials are resolved locally through the normal provider credential system
+and never appear in progress events, manifests, durable records, or the Agents
+UI. Calls that omit `lane` retain the existing global delegation behavior.
 
 ## Inherited Tool Access
 
@@ -220,7 +262,7 @@ The dispatch response includes the paths as `live_transcripts`, and the files ar
 tail -f ~/.hermes/cache/delegation/live/deleg_ab12cd34/task-0.log
 ```
 
-Each line is timestamped and shows the child's assistant text, thinking snippets, tool calls (`-> tool_name({args})`), tool results, and a final status marker. A `manifest.json` in the same directory describes the batch (goals, task count, per-task status). The logs persist after completion — they double as the full-fidelity operational record alongside the summary — and directories older than 7 days are pruned automatically on new dispatches. Because they live under `cache/delegation`, they are also readable from remote terminal backends (Docker/Modal/SSH).
+Each line is timestamped and shows the child's assistant text, thinking snippets, tool calls (`-> tool_name({args})`), tool results, and a final status marker. A `manifest.json` in the same directory describes the batch (goals, task count, per-task status, and the non-secret `lane`/`provider`/`model` route identity when available). The logs persist after completion — they double as the full-fidelity operational record alongside the summary — and directories older than 7 days are pruned automatically on new dispatches. Because they live under `cache/delegation`, they are also readable from remote terminal backends (Docker/Modal/SSH).
 
 ## Depth Limit and Nested Orchestration
 
@@ -249,7 +291,7 @@ Top-level model-facing `delegate_task` calls run in the background automatically
 
 - Normal follow-up messages do not cancel background children. `/stop` cancels running background delegations, and closing or resetting the owning session discards its active children.
 - Explicit session close/reset interrupts that session's background children. Closing a TUI viewer of a gateway-owned session does not kill the gateway's work.
-- A Hermes process restart does **not** resume a running child. Its attempt becomes `unknown` because Hermes cannot prove which side effects happened.
+- A Hermes process restart does **not** resume a running child. Its attempt is published with `status="failed"` and `exit_reason="owner_exit"` because Hermes cannot prove which side effects happened.
 - A child that completed before restart but whose result was not delivered is restored and routed back through the owning session's normal checks.
 - Cancelled children return a structured result (`status="interrupted"`, `exit_reason="interrupted"`), but because the parent was interrupted too, that result often never makes it into a user-visible reply.
 
@@ -295,6 +337,13 @@ delegation:
   model: "google/gemini-3-flash-preview"             # Optional provider/model override
   provider: "openrouter"                             # Optional built-in provider
   api_mode: anthropic_messages                       # optional; auto-detected from base_url for anthropic_messages endpoints
+  lanes:                                             # Optional trusted symbolic route overlays
+    review:
+      provider: xai-oauth
+      model: grok-4.5
+      reasoning_effort: high
+    paused:
+      enabled: false
 
 # Or use a direct custom endpoint instead of provider:
 delegation:

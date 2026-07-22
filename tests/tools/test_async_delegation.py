@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+from typing import Any
 
 import pytest
 
@@ -141,6 +142,243 @@ def test_completion_event_lands_on_shared_queue_with_session_key():
     assert evt["session_key"] == "agent:main:cli:dm:local"
     assert evt["parent_session_id"] == "20260703_parent_sid"
     assert evt["delegation_id"] == res["delegation_id"]
+
+
+def test_batch_completion_preserves_resolved_lane_route():
+    res = ad.dispatch_async_delegation_batch(
+        goals=["review"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        lane="review",
+        provider="xai-oauth",
+        model="grok-4.5",
+        session_key="session",
+        runner=lambda: {"results": [{"status": "completed", "summary": "clean"}]},
+        max_async_children=1,
+    )
+
+    evt = _drain_for(res["delegation_id"])
+    assert evt["lane"] == "review"
+    assert evt["provider"] == "xai-oauth"
+    assert evt["model"] == "grok-4.5"
+
+
+def test_batch_crash_redacts_exception_and_persists_route_identity(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    sentinel = "https://secret.invalid/v1 api-key acp-command --secret-arg"
+
+    def runner():
+        raise RuntimeError(sentinel)
+
+    res = ad.dispatch_async_delegation_batch(
+        goals=["review"], context=None, toolsets=None, role="leaf",
+        lane="review", provider="xai-oauth", model="grok-4.5",
+        session_key="session", runner=runner, max_async_children=1,
+    )
+
+    evt = _drain_for(res["delegation_id"])
+    durable = ad.get_durable_delegation(res["delegation_id"])
+    assert durable is not None
+    rendered = json.dumps({"event": evt, "durable": durable})
+    assert sentinel not in rendered
+    assert durable["result"]["lane"] == "review"
+    assert durable["result"]["provider"] == "xai-oauth"
+    assert durable["result"]["model"] == "grok-4.5"
+
+
+def test_failed_completion_payload_is_sanitized_before_queue_and_persistence(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    sentinel = (
+        "https://secret.invalid/v1 api_mode=private-wire api-key "
+        "request_override fallback-command --secret-arg"
+    )
+
+    dispatched = ad.dispatch_async_delegation(
+        goal="failed",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="review-model",
+        session_key="owner",
+        parent_session_id="parent",
+        runner=lambda: {
+            "status": "failed",
+            "summary": sentinel,
+            "error": sentinel,
+            "final_response": sentinel,
+            "output_tail": [{"preview": sentinel}],
+            "nested": {"payload": sentinel},
+            "completed": True,
+            "failed": False,
+            "api_calls": 1,
+        },
+    )
+
+    evt = _drain_for(dispatched["delegation_id"])
+    assert evt is not None
+    durable = ad.get_durable_delegation(dispatched["delegation_id"])
+    assert durable is not None
+    rendered = json.dumps({"event": evt, "durable": durable})
+    assert sentinel not in rendered
+    assert evt["status"] == "failed"
+    assert evt["summary"] is None
+    assert evt["error"] == "DelegationError: subagent reported failure"
+    assert "final_response" not in durable["result"]
+    assert "output_tail" not in durable["result"]
+    assert "nested" not in durable["result"]
+    assert "completed" not in durable["result"]
+    assert "failed" not in durable["result"]
+
+
+def test_failed_batch_child_payload_is_sanitized_before_queue_and_persistence(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    sentinel = (
+        "https://secret.invalid/v1 api_mode=private-wire api-key "
+        "request_override fallback-command --secret-arg"
+    )
+
+    dispatched = ad.dispatch_async_delegation_batch(
+        goals=["failed"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        lane="review",
+        provider="xai-oauth",
+        model="review-model",
+        session_key="owner",
+        parent_session_id="parent",
+        runner=lambda: {
+            "status": "completed",
+            "summary": sentinel,
+            "error": sentinel,
+            "final_response": sentinel,
+            "output_tail": [{"preview": sentinel}],
+            "nested": {"payload": sentinel},
+            "completed": True,
+            "failed": False,
+            "results": [
+                {
+                    "task_index": 0,
+                    "status": "completed",
+                    "summary": sentinel,
+                    "error": sentinel,
+                    "final_response": sentinel,
+                    "output_tail": [{"preview": sentinel}],
+                    "nested": {"payload": sentinel},
+                    "completed": True,
+                    "failed": False,
+                    "api_calls": 1,
+                }
+            ],
+            "lane": "review",
+            "provider": "xai-oauth",
+            "model": "review-model",
+        },
+    )
+
+    evt = _drain_for(dispatched["delegation_id"])
+    assert evt is not None
+    durable = ad.get_durable_delegation(dispatched["delegation_id"])
+    assert durable is not None
+    rendered = json.dumps({"event": evt, "durable": durable})
+    assert sentinel not in rendered
+    assert evt["status"] == "failed"
+    assert evt["results"][0]["summary"] is None
+    assert evt["results"][0]["error"] == (
+        "DelegationError: subagent reported failure"
+    )
+    assert "final_response" not in durable["result"]
+    assert "output_tail" not in durable["result"]
+    assert "nested" not in durable["result"]
+    assert "completed" not in durable["result"]
+    assert "failed" not in durable["result"]
+
+
+def test_timeout_diagnostic_metadata_survives_failure_sanitization(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    diagnostic = tmp_path / "logs" / "subagent-timeout-deleg_test-20260720.log"
+    safe, status = ad._sanitize_completion_payload(
+        {
+            "status": "failed",
+            "summary": None,
+            "error": "untrusted details",
+            "exit_reason": "timeout",
+            "diagnostic_path": str(diagnostic),
+        },
+        "failed",
+    )
+
+    assert status == "failed"
+    assert safe["exit_reason"] == "timeout"
+    assert safe["diagnostic_path"] == str(diagnostic)
+
+    untrusted, _ = ad._sanitize_completion_payload(
+        {
+            "status": "failed",
+            "error": "untrusted details",
+            "exit_reason": "timeout",
+            "diagnostic_path": str(tmp_path / "stolen-secret.txt"),
+        },
+        "failed",
+    )
+    assert "diagnostic_path" not in untrusted
+
+
+def test_failure_sanitization_preserves_only_known_exit_reasons():
+    known, status = ad._sanitize_completion_payload(
+        {
+            "status": "failed",
+            "error": "untrusted details",
+            "exit_reason": "max_iterations",
+        },
+        "failed",
+    )
+    malformed_status: Any = ["failed"]
+    unknown, _ = ad._sanitize_completion_payload(
+        {
+            "status": "failed",
+            "error": "untrusted details",
+            "exit_reason": ["route-secret-or-provider-text"],
+        },
+        malformed_status,
+    )
+
+    assert status == "failed"
+    assert known["exit_reason"] == "max_iterations"
+    assert unknown["exit_reason"] == "failed"
+
+
+def test_all_failed_batch_preserves_uniform_safe_exit_reason():
+    safe, status = ad._sanitize_completion_payload(
+        {
+            "results": [
+                {
+                    "task_index": 0,
+                    "status": "failed",
+                    "error": "details",
+                    "exit_reason": "timeout",
+                },
+                {
+                    "task_index": 1,
+                    "status": "failed",
+                    "error": "details",
+                    "exit_reason": "timeout",
+                },
+            ]
+        },
+        "error",
+    )
+
+    assert status == "failed"
+    assert safe["exit_reason"] == "timeout"
+    assert {child["exit_reason"] for child in safe["results"]} == {"timeout"}
 
 
 def test_rich_reinjection_block_is_self_contained():
@@ -341,10 +579,282 @@ def test_submit_failure_removes_durable_running_record(tmp_path, monkeypatch):
         assert conn.execute("SELECT COUNT(*) FROM async_delegations").fetchone()[0] == 0
 
 
+@pytest.mark.parametrize("is_batch", [False, True])
+def test_submit_failure_cancels_callable_that_may_already_be_queued(
+    monkeypatch, is_batch
+):
+    queued = []
+    ran = []
+
+    class _UncertainExecutor:
+        def submit(self, fn):
+            queued.append(fn)
+            raise RuntimeError("worker creation failed after enqueue")
+
+    def runner():
+        ran.append("ran")
+        return {"status": "completed", "summary": "unexpected"}
+
+    monkeypatch.setattr(ad, "_get_executor", lambda _max_workers: _UncertainExecutor())
+    kwargs = {
+        "context": None,
+        "toolsets": None,
+        "role": "leaf",
+        "model": "m",
+        "session_key": "owner",
+        "runner": runner,
+    }
+    if is_batch:
+        result = ad.dispatch_async_delegation_batch(goals=["never ran"], **kwargs)
+    else:
+        result = ad.dispatch_async_delegation(goal="never ran", **kwargs)
+
+    assert result["status"] == "rejected"
+    assert ran == []
+    assert len(queued) == 1
+
+    # ThreadPoolExecutor.submit() may enqueue before worker creation raises.
+    # A queued wrapper that starts after rejection must not execute the task.
+    queued[0]()
+    assert ran == []
+
+
+@pytest.mark.parametrize("is_batch", [False, True])
+def test_submit_and_rollback_double_failure_still_returns_rejection(
+    monkeypatch, is_batch
+):
+    class _BrokenExecutor:
+        def submit(self, *_args, **_kwargs):
+            raise RuntimeError("submit failed")
+
+    monkeypatch.setattr(ad, "_get_executor", lambda _max_workers: _BrokenExecutor())
+    monkeypatch.setattr(
+        ad,
+        "_delete_durable_delegation",
+        lambda _delegation_id: (_ for _ in ()).throw(OSError("delete failed")),
+    )
+    delegation_id = f"deleg_double_failure_{is_batch}"
+    kwargs = {
+        "context": None,
+        "toolsets": None,
+        "role": "leaf",
+        "model": "m",
+        "session_key": "owner",
+        "runner": lambda: {},
+    }
+    if is_batch:
+        result = ad.dispatch_async_delegation_batch(
+            goals=["never ran"], delegation_id=delegation_id, **kwargs
+        )
+    else:
+        monkeypatch.setattr(ad, "_new_delegation_id", lambda: delegation_id)
+        result = ad.dispatch_async_delegation(goal="never ran", **kwargs)
+
+    assert result["status"] == "rejected"
+    assert "RuntimeError" in result["error"]
+    durable = ad.get_durable_delegation(delegation_id)
+    assert durable is not None
+    assert durable["state"] == "failed"
+    assert durable["delivery_state"] == "delivered"
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 0
+    assert restored.empty()
+
+
+def test_dispatch_persistence_failure_rejects_without_active_record(monkeypatch):
+    ran = False
+
+    def runner():
+        nonlocal ran
+        ran = True
+        return {"status": "completed", "summary": "done"}
+
+    monkeypatch.setattr(
+        ad, "_persist_dispatch", lambda _record: (_ for _ in ()).throw(OSError("disk full"))
+    )
+    result = ad.dispatch_async_delegation(
+        goal="never ran", context=None, toolsets=None, role="leaf", model="m",
+        session_key="owner", runner=runner,
+    )
+
+    assert result["status"] == "rejected"
+    assert ad.active_count() == 0
+    assert ran is False
+
+
+@pytest.mark.parametrize("is_batch", [False, True])
+def test_post_commit_dispatch_failure_tombstones_rejected_work(
+    tmp_path, monkeypatch, is_batch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    delegation_id = f"deleg_post_commit_{is_batch}"
+    real_persist_dispatch = ad._persist_dispatch
+
+    def commit_then_fail(record):
+        real_persist_dispatch(record)
+        raise OSError("post-commit prune failed")
+
+    monkeypatch.setattr(ad, "_persist_dispatch", commit_then_fail)
+    monkeypatch.setattr(
+        ad,
+        "_delete_durable_delegation",
+        lambda _delegation_id: (_ for _ in ()).throw(OSError("delete failed")),
+    )
+    kwargs = {
+        "context": None,
+        "toolsets": None,
+        "role": "leaf",
+        "model": "m",
+        "session_key": "owner",
+        "runner": lambda: {"status": "completed", "summary": "must not run"},
+    }
+    if is_batch:
+        result = ad.dispatch_async_delegation_batch(
+            goals=["must not run"], delegation_id=delegation_id, **kwargs
+        )
+    else:
+        monkeypatch.setattr(ad, "_new_delegation_id", lambda: delegation_id)
+        result = ad.dispatch_async_delegation(goal="must not run", **kwargs)
+
+    assert result["status"] == "rejected"
+    durable = ad.get_durable_delegation(delegation_id)
+    assert durable is not None
+    assert durable["state"] == "failed"
+    assert durable["delivery_state"] == "delivered"
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 0
+    assert restored.empty()
+
+
+def test_batch_dispatch_persistence_failure_rejects_without_active_record(monkeypatch):
+    monkeypatch.setattr(
+        ad, "_persist_dispatch", lambda _record: (_ for _ in ()).throw(OSError("disk full"))
+    )
+    result = ad.dispatch_async_delegation_batch(
+        goals=["never ran"], context=None, toolsets=None, role="leaf", model="m",
+        session_key="owner", runner=lambda: {"results": []},
+    )
+
+    assert result["status"] == "rejected"
+    assert ad.active_count() == 0
+
+
+def test_completion_persistence_failure_still_delivers_and_finishes(monkeypatch):
+    monkeypatch.setattr(
+        ad, "_persist_completion", lambda *_args: (_ for _ in ()).throw(OSError("disk full"))
+    )
+    result = ad.dispatch_async_delegation(
+        goal="finishes", context=None, toolsets=None, role="leaf", model="m",
+        session_key="owner",
+        runner=lambda: {"status": "completed", "summary": "done"},
+    )
+
+    event = _drain_for(result["delegation_id"])
+    assert event is not None
+    assert event["summary"] == "done"
+    deadline = time.monotonic() + 2
+    while ad.active_count() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ad.active_count() == 0
+    assert ad.get_durable_delegation(result["delegation_id"]) is None
+
+
+def test_batch_completion_persistence_failure_still_delivers_and_finishes(monkeypatch):
+    monkeypatch.setattr(
+        ad, "_persist_completion", lambda *_args: (_ for _ in ()).throw(OSError("disk full"))
+    )
+    result = ad.dispatch_async_delegation_batch(
+        goals=["finishes"], context=None, toolsets=None, role="leaf", model="m",
+        session_key="owner",
+        runner=lambda: {
+            "results": [{"status": "completed", "summary": "done"}],
+        },
+    )
+
+    event = _drain_for(result["delegation_id"])
+    assert event is not None
+    assert event["results"][0]["summary"] == "done"
+    deadline = time.monotonic() + 2
+    while ad.active_count() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ad.active_count() == 0
+    assert ad.get_durable_delegation(result["delegation_id"]) is None
+
+
+def test_single_completion_persists_before_process_registry_import(monkeypatch):
+    delegation_id = "deleg_registry_import_single"
+    record = {
+        "delegation_id": delegation_id,
+        "session_key": "owner",
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "goal": "done",
+        "dispatched_at": 1.0,
+        "completed_at": 2.0,
+    }
+    ad._persist_dispatch(record)
+    real_import = __import__
+
+    def fail_registry_import(name, *args, **kwargs):
+        if name == "tools.process_registry":
+            raise ImportError("registry unavailable")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", fail_registry_import)
+    ad._push_completion_event(
+        record, {"status": "completed", "summary": "done"}, "completed"
+    )
+
+    durable = ad.get_durable_delegation(delegation_id)
+    assert durable is not None
+    assert durable["state"] == "completed"
+    assert durable["result"]["summary"] == "done"
+
+
+def test_batch_completion_persists_before_process_registry_import(monkeypatch):
+    delegation_id = "deleg_registry_import_batch"
+    record = {
+        "delegation_id": delegation_id,
+        "session_key": "owner",
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "goal": "done",
+        "goals": ["done"],
+        "dispatched_at": 1.0,
+        "completed_at": None,
+        "status": "running",
+        "interrupt_fn": None,
+        "is_batch": True,
+    }
+    with ad._records_lock:
+        ad._records[delegation_id] = record
+    ad._persist_dispatch(record)
+    real_import = __import__
+
+    def fail_registry_import(name, *args, **kwargs):
+        if name == "tools.process_registry":
+            raise ImportError("registry unavailable")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", fail_registry_import)
+    ad._finalize_batch(
+        delegation_id,
+        {"results": [{"status": "completed", "summary": "done"}]},
+        "completed",
+    )
+
+    durable = ad.get_durable_delegation(delegation_id)
+    assert durable is not None
+    assert durable["state"] == "completed"
+    assert durable["result"]["results"][0]["summary"] == "done"
+
+
 def test_pending_retention_prunes_delivered_before_undelivered(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 2)
-    for index, delivery_state in enumerate(("pending", "delivered", "pending")):
+    for index, delivery_state in enumerate(
+        ("pending", "delivered", "delivered", "delivered")
+    ):
         delegation_id = f"deleg_{index}"
         record = {
             "delegation_id": delegation_id,
@@ -370,9 +880,42 @@ def test_pending_retention_prunes_delivered_before_undelivered(tmp_path, monkeyp
     assert ad.get_durable_delegation("deleg_0") is not None
     assert ad.get_durable_delegation("deleg_1") is None
     assert ad.get_durable_delegation("deleg_2") is not None
+    assert ad.get_durable_delegation("deleg_3") is not None
 
 
-def test_recover_marks_abandoned_running_record_unknown(tmp_path, monkeypatch):
+def test_terminal_history_cap_never_prunes_pending_completions(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 2)
+    monkeypatch.setattr(ad, "_MAX_DURABLE_PENDING", 5)
+    for index in range(7):
+        delegation_id = f"deleg_pending_{index}"
+        record = {
+            "delegation_id": delegation_id,
+            "session_key": "owner",
+            "origin_ui_session_id": "",
+            "parent_session_id": None,
+            "dispatched_at": float(index),
+        }
+        ad._persist_dispatch(record)
+        ad._persist_completion(
+            {
+                "type": "async_delegation",
+                "delegation_id": delegation_id,
+                "status": "completed",
+                "completed_at": float(index),
+            },
+            {"status": "completed", "summary": delegation_id},
+        )
+
+    ad._prune_durable_records()
+
+    assert all(
+        ad.get_durable_delegation(f"deleg_pending_{index}") is not None
+        for index in range(7)
+    )
+
+
+def test_recover_marks_abandoned_running_record_failed(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     record = {
         "delegation_id": "deleg_abandoned",
@@ -380,6 +923,9 @@ def test_recover_marks_abandoned_running_record_unknown(tmp_path, monkeypatch):
         "origin_ui_session_id": "",
         "parent_session_id": None,
         "dispatched_at": 1.0,
+        "lane": "review",
+        "provider": "xai-oauth",
+        "model": "grok-4.5",
     }
     ad._persist_dispatch(record)
     with ad._DB_LOCK, ad._connect() as conn:
@@ -390,11 +936,114 @@ def test_recover_marks_abandoned_running_record_unknown(tmp_path, monkeypatch):
 
     assert ad.recover_abandoned_delegations() == 1
     durable = ad.get_durable_delegation("deleg_abandoned")
-    assert durable["state"] == "unknown"
+    assert durable is not None
+    assert durable["state"] == "failed"
     assert durable["delivery_state"] == "pending"
+    assert durable["result"]["lane"] == "review"
+    assert durable["result"]["provider"] == "xai-oauth"
+    assert durable["result"]["model"] == "grok-4.5"
     restored = queue.Queue()
     assert ad.restore_undelivered_completions(restored) == 1
-    assert restored.get_nowait()["status"] == "unknown"
+    restored_event = restored.get_nowait()
+    assert restored_event["status"] == "failed"
+    assert restored_event["exit_reason"] == "owner_exit"
+
+
+def test_recovery_drops_delivered_stale_running_row_without_duplicate(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    record = {
+        "delegation_id": "deleg_delivered_stale",
+        "session_key": "owner",
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "dispatched_at": 1.0,
+    }
+    ad._persist_dispatch(record)
+    assert ad.mark_completion_delivered("deleg_delivered_stale")
+    with ad._DB_LOCK, ad._connect() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET owner_pid=?, owner_started_at=NULL "
+            "WHERE delegation_id=?",
+            (99999999, "deleg_delivered_stale"),
+        )
+
+    assert ad.recover_abandoned_delegations() == 1
+    assert ad.get_durable_delegation("deleg_delivered_stale") is None
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 0
+    assert restored.empty()
+
+
+def test_malformed_abandoned_task_json_does_not_abort_recovery(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for delegation_id in ("deleg_corrupt_task", "deleg_valid_task"):
+        ad._persist_dispatch(
+            {
+                "delegation_id": delegation_id,
+                "session_key": "owner",
+                "origin_ui_session_id": "",
+                "parent_session_id": None,
+                "dispatched_at": 1.0,
+                "goal": "recover me",
+            }
+        )
+    with ad._DB_LOCK, ad._connect() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET owner_pid=?, owner_started_at=NULL",
+            (99999999,),
+        )
+        conn.execute(
+            "UPDATE async_delegations SET task_json='{' WHERE delegation_id=?",
+            ("deleg_corrupt_task",),
+        )
+
+    assert ad.recover_abandoned_delegations() == 2
+    corrupt = ad.get_durable_delegation("deleg_corrupt_task")
+    valid = ad.get_durable_delegation("deleg_valid_task")
+    assert corrupt is not None
+    assert valid is not None
+    assert corrupt["state"] == "failed"
+    assert valid["state"] == "failed"
+
+
+def test_malformed_event_json_does_not_block_later_valid_restoration(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for index, delegation_id in enumerate(
+        ("deleg_corrupt_event", "deleg_valid_event"), start=1
+    ):
+        ad._persist_dispatch(
+            {
+                "delegation_id": delegation_id,
+                "session_key": "owner",
+                "origin_ui_session_id": "",
+                "parent_session_id": None,
+                "dispatched_at": float(index),
+            }
+        )
+        ad._persist_completion(
+            {
+                "type": "async_delegation",
+                "delegation_id": delegation_id,
+                "status": "completed",
+                "completed_at": float(index),
+            },
+            {"status": "completed", "summary": delegation_id},
+        )
+    with ad._DB_LOCK, ad._connect() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET event_json='{' WHERE delegation_id=?",
+            ("deleg_corrupt_event",),
+        )
+
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 1
+    assert restored.get_nowait()["delegation_id"] == "deleg_valid_event"
+    assert restored.empty()
+    assert ad.get_durable_delegation("deleg_corrupt_event") is None
 
 
 def test_durable_delivery_claim_is_exclusive_and_retryable(tmp_path, monkeypatch):
@@ -417,6 +1066,64 @@ def test_durable_delivery_claim_is_exclusive_and_retryable(tmp_path, monkeypatch
     assert ad.complete_completion_delivery("deleg_claim", "consumer-b")
     assert not ad.claim_completion_delivery("deleg_claim", "consumer-c")
     assert ad.get_durable_delegation("deleg_claim")["delivery_state"] == "delivered"
+
+
+def test_event_delivery_pending_distinguishes_blocked_from_delivered(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    event = {"type": "async_delegation", "delegation_id": "deleg_pending_state"}
+    ad._persist_dispatch(
+        {
+            "delegation_id": "deleg_pending_state",
+            "status": "running",
+            "dispatched_at": 1.0,
+        }
+    )
+    ad._persist_completion(
+        {
+            "delegation_id": "deleg_pending_state",
+            "status": "completed",
+            "completed_at": 2.0,
+        },
+        {"status": "completed", "summary": "done"},
+    )
+
+    assert ad.event_delivery_is_pending(event)
+    assert ad.claim_completion_delivery("deleg_pending_state", "consumer-a")
+    assert ad.event_delivery_is_pending(event)
+    assert ad.complete_completion_delivery("deleg_pending_state", "consumer-a")
+    assert not ad.event_delivery_is_pending(event)
+
+
+def test_completion_delivery_claim_renewal_prevents_expiry_reclaim(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    record = {
+        "delegation_id": "deleg_renewed_claim",
+        "session_key": "owner",
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "dispatched_at": 1.0,
+    }
+    ad._persist_dispatch(record)
+    ad._persist_completion(
+        {
+            "delegation_id": "deleg_renewed_claim",
+            "status": "completed",
+            "completed_at": 2.0,
+        },
+        {"status": "completed", "summary": "done"},
+    )
+
+    monkeypatch.setattr(ad.time, "time", lambda: 1_000.0)
+    assert ad.claim_completion_delivery("deleg_renewed_claim", "consumer-a")
+    monkeypatch.setattr(ad.time, "time", lambda: 1_299.0)
+    assert ad.renew_completion_delivery("deleg_renewed_claim", "consumer-a")
+    monkeypatch.setattr(ad.time, "time", lambda: 1_301.0)
+    assert not ad.claim_completion_delivery("deleg_renewed_claim", "consumer-b")
+    assert ad.complete_completion_delivery("deleg_renewed_claim", "consumer-a")
 
 
 # ---------------------------------------------------------------------------
@@ -485,6 +1192,66 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     text = format_process_notification(evt)
     assert text is not None
     assert "the real task" in text
+
+
+def test_rejected_background_dispatch_reattaches_child_before_inline_fallback(
+    monkeypatch,
+):
+    from unittest.mock import MagicMock
+    import json
+    import tools.delegate_tool as dt
+
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = "sess"
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = None
+    child = MagicMock()
+    child._delegate_role = "leaf"
+    child._subagent_id = "s1"
+
+    def build_child(**_kwargs):
+        parent._active_children.append(child)
+        return child
+
+    def run_child(task_index, goal, child=None, parent_agent=None, **_kwargs):
+        assert parent_agent is not None
+        assert child in parent_agent._active_children
+        return {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": f"done: {goal}",
+            "api_calls": 1,
+            "duration_seconds": 0.1,
+            "model": "m",
+            "exit_reason": "completed",
+        }
+
+    creds = {
+        "model": "m",
+        "provider": None,
+        "base_url": None,
+        "api_key": None,
+        "api_mode": None,
+        "command": None,
+        "args": None,
+    }
+    monkeypatch.setattr(dt, "_build_child_agent", build_child)
+    monkeypatch.setattr(dt, "_run_single_child", run_child)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
+    monkeypatch.setattr(
+        ad,
+        "dispatch_async_delegation_batch",
+        lambda **_kwargs: {"status": "rejected", "error": "at capacity"},
+    )
+
+    parsed = json.loads(
+        dt.delegate_task(goal="fallback", background=True, parent_agent=parent)
+    )
+
+    assert parsed["results"][0]["status"] == "completed"
+    assert "SYNCHRONOUSLY" in parsed["note"]
 
 
 def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):

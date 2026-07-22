@@ -18,13 +18,16 @@ export interface SubagentProgress {
   goal: string
   /** The child's own stored session id — lets UIs open its session window. */
   sessionId?: string
+  lane?: string
   model?: string
+  provider?: string
   status: SubagentStatus
   taskCount: number
   taskIndex: number
   startedAt: number
   updatedAt: number
   durationSeconds?: number
+  exitReason?: string
   costUsd?: number
   inputTokens?: number
   outputTokens?: number
@@ -159,13 +162,16 @@ function toProgress(payload: SubagentPayload, prev: SubagentProgress | undefined
     parentId: str(payload.parent_id) || prev?.parentId || null,
     goal: str(payload.goal) || prev?.goal || 'Subagent',
     sessionId: str(payload.child_session_id) || prev?.sessionId,
+    lane: str(payload.lane) || prev?.lane,
     model: str(payload.model) || prev?.model,
+    provider: str(payload.provider) || prev?.provider,
     status,
     taskCount: num(payload.task_count) ?? prev?.taskCount ?? 1,
     taskIndex: num(payload.task_index) ?? prev?.taskIndex ?? 0,
     startedAt: prev?.startedAt ?? at,
     updatedAt: at,
     durationSeconds: num(payload.duration_seconds) ?? prev?.durationSeconds,
+    exitReason: str(payload.exit_reason) || prev?.exitReason,
     costUsd: num(payload.cost_usd) ?? prev?.costUsd,
     inputTokens: num(payload.input_tokens) ?? prev?.inputTokens,
     outputTokens: num(payload.output_tokens) ?? prev?.outputTokens,

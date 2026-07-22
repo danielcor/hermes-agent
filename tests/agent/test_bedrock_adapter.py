@@ -11,7 +11,7 @@ Covers:
 
 import json
 from contextlib import contextmanager
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -112,6 +112,103 @@ class TestHasAwsCredentials:
             import botocore.session as _bs
             _bs.get_session = MagicMock(return_value=mock_session)
             assert has_aws_credentials({}) is False
+
+
+class TestBedrockCredentialSnapshot:
+    def test_capture_pins_session_and_records_issued_credentials(self):
+        from agent.bedrock_adapter import capture_bedrock_credentials
+
+        frozen = SimpleNamespace(
+            access_key="ACCESS-A",
+            secret_key="SECRET-A",
+            token="TOKEN-A",
+        )
+        credentials = MagicMock()
+        credentials.get_frozen_credentials.return_value = frozen
+        session = MagicMock()
+        session.get_credentials.return_value = credentials
+        runtime_client = object()
+        session.client.return_value = runtime_client
+        boto3 = MagicMock()
+        boto3.Session.return_value = session
+
+        with patch("agent.bedrock_adapter._require_boto3", return_value=boto3):
+            snapshot = capture_bedrock_credentials()
+
+        session.get_credentials.assert_called_once_with()
+        assert snapshot.runtime_client("us-west-2") is runtime_client
+        session.client.assert_called_once_with("bedrock-runtime", region_name="us-west-2")
+        assert snapshot.anthropic_client_kwargs() == {
+            "aws_access_key": "ACCESS-A",
+            "aws_secret_key": "SECRET-A",
+            "aws_session_token": "TOKEN-A",
+        }
+        assert set(snapshot.publication_secrets()) == {
+            "ACCESS-A", "SECRET-A", "TOKEN-A"
+        }
+
+    def test_capture_rejects_empty_sigv4_chain(self):
+        from agent import bedrock_adapter as ba
+
+        session = MagicMock()
+        session.get_credentials.return_value = None
+        boto3 = MagicMock()
+        boto3.Session.return_value = session
+
+        with patch("agent.bedrock_adapter._require_boto3", return_value=boto3):
+            with pytest.raises(RuntimeError, match="returned no credentials"):
+                ba.capture_bedrock_credentials()
+
+    def test_bearer_token_replaces_live_environment_provider(self, monkeypatch):
+        from agent import bedrock_adapter as ba
+
+        captured = {}
+
+        class FakeBoto:
+            @staticmethod
+            def Session(**kwargs):
+                captured["botocore_session"] = kwargs["botocore_session"]
+                return SimpleNamespace(client=MagicMock())
+
+        monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "bearer-A")
+        monkeypatch.setattr(ba, "_require_boto3", lambda: FakeBoto())
+
+        snapshot = ba.capture_bedrock_credentials()
+        monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "bearer-B")
+
+        token_provider = captured["botocore_session"].get_component("token_provider")
+        token = token_provider.load_token(signing_name="bedrock")
+        assert token.token == "bearer-A"
+        assert "bearer-A" in snapshot.publication_secrets()
+        assert "bearer-B" not in snapshot.publication_secrets()
+
+    def test_nonstreaming_dispatch_uses_frozen_runtime_client(self):
+        from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
+
+        client = MagicMock()
+        client.converse.return_value = {
+            "output": {"message": {"role": "assistant", "content": [{"text": "ok"}]}},
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+        }
+        snapshot = MagicMock()
+        snapshot.runtime_client.return_value = client
+        agent = SimpleNamespace(
+            api_mode="bedrock_converse",
+            provider="bedrock",
+            _frozen_bedrock_credentials=snapshot,
+        )
+        kwargs = {"__bedrock_region__": "us-west-2", "modelId": "model"}
+
+        with patch("agent.bedrock_adapter._get_bedrock_runtime_client") as ambient:
+            _dispatch_nonstreaming_api_request(
+                agent,
+                kwargs,
+                make_client=lambda *_args, **_kwargs: None,
+            )
+
+        snapshot.runtime_client.assert_called_once_with("us-west-2")
+        ambient.assert_not_called()
 
 
 class TestResolveBedrocRegion:

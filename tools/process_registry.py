@@ -2048,6 +2048,8 @@ def _format_async_delegation(evt: dict) -> str:
     context = evt.get("context")
     toolsets = evt.get("toolsets")
     role = evt.get("role") or "leaf"
+    lane = evt.get("lane")
+    provider = evt.get("provider")
     model = evt.get("model") or "?"
     status = evt.get("status") or "completed"
     summary = evt.get("summary")
@@ -2083,7 +2085,13 @@ def _format_async_delegation(evt: dict) -> str:
             lines.append(f"Context you provided: {context}")
         if toolsets:
             lines.append(f"Toolsets: {', '.join(toolsets)}")
-        lines.append(f"Role: {role}   Model: {model}   Total duration: {total_dur}s")
+        route = []
+        if lane:
+            route.append(f"Lane: {lane}")
+        if provider:
+            route.append(f"Provider: {provider}")
+        route.append(f"Model: {model}")
+        lines.append(f"Role: {role}   {'   '.join(route)}   Total duration: {total_dur}s")
         if error and not results:
             lines.append("--- ERROR ---")
             lines.append(f"The batch did not complete successfully: {error}")
@@ -2145,7 +2153,13 @@ def _format_async_delegation(evt: dict) -> str:
         lines.append(f"Context you provided: {context}")
     if toolsets:
         lines.append(f"Toolsets: {', '.join(toolsets)}")
-    lines.append(f"Role: {role}   Model: {model}")
+    route = []
+    if lane:
+        route.append(f"Lane: {lane}")
+    if provider:
+        route.append(f"Provider: {provider}")
+    route.append(f"Model: {model}")
+    lines.append(f"Role: {role}   {'   '.join(route)}")
     lines.append(f"Status: {status}   API calls: {api_calls}   Duration: {duration}s")
     lines.append("--- RESULT ---")
     if status in ("completed", "success") and summary:

@@ -25,6 +25,7 @@ export interface SubagentProgress {
   costUsd?: number
   depth: number
   durationSeconds?: number
+  exitReason?: string
   filesRead?: string[]
   filesWritten?: string[]
   goal: string
@@ -32,11 +33,13 @@ export interface SubagentProgress {
   index: number
   inputTokens?: number
   iteration?: number
+  lane?: string
   model?: string
   notes: string[]
   outputTail?: SubagentOutputEntry[]
   outputTokens?: number
   parentId: null | string
+  provider?: string
   reasoningTokens?: number
   startedAt?: number
   status: SubagentStatus
@@ -77,8 +80,10 @@ export interface DelegationStatus {
   active: {
     depth?: number
     goal?: string
+    lane?: null | string
     model?: null | string
     parent_id?: null | string
+    provider?: null | string
     started_at?: number
     status?: string
     subagent_id?: string

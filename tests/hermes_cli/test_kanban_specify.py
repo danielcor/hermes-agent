@@ -423,3 +423,74 @@ def test_manual_specify_non_triage_reason_matches_llm_path(kanban_home):
 
     assert manual.ok is False
     assert "task is not in triage" in manual.reason
+
+
+def test_cli_manual_specify_promotes_without_aux_llm(kanban_home, capsys):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True)
+
+    with patch("agent.auxiliary_client.call_llm") as call_llm:
+        rc = _run_cli(
+            "specify", tid,
+            "--title", "clean title",
+            "--body", "clean body",
+            "--assignee", "claude-triage",
+        )
+
+    assert rc == 0
+    call_llm.assert_not_called()
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    # Parent-free → recompute_ready promotes to ready (specify_triage_task
+    # calls recompute_ready synchronously after commit).
+    assert task.status == "ready"
+    assert task.title == "clean title"
+    assert task.assignee == "claude-triage"
+
+
+def test_cli_manual_specify_rejects_all(kanban_home, capsys):
+    rc = _run_cli("specify", "--all", "--body", "shared body")
+    assert rc == 2
+    assert "cannot be combined with --all" in capsys.readouterr().err
+
+
+def test_cli_assignee_requires_manual_mode(kanban_home, capsys):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True)
+    rc = _run_cli("specify", tid, "--assignee", "claude-triage")
+    assert rc == 2
+    assert "--assignee requires --title or --body" in capsys.readouterr().err
+
+
+def test_cli_manual_specify_json_shape_matches_llm_path(kanban_home, capsys):
+    with kb.connect() as conn:
+        manual_id = kb.create_task(conn, title="m", triage=True)
+        llm_id = kb.create_task(conn, title="l", triage=True)
+
+    rc = _run_cli("specify", manual_id, "--body", "manual body", "--json")
+    assert rc == 0
+    manual_payload = jsonlib.loads(capsys.readouterr().out.strip())
+
+    p, _ = _patch_aux_client(jsonlib.dumps({"title": "t", "body": "b"}))
+    with p:
+        rc = _run_cli("specify", llm_id, "--json")
+    assert rc == 0
+    llm_payload = jsonlib.loads(capsys.readouterr().out.strip())
+
+    assert manual_payload.keys() == llm_payload.keys()
+    assert manual_payload["ok"] is True
+    assert manual_payload["task_id"] == manual_id
+
+
+def test_cli_manual_specify_author_recorded(kanban_home, capsys):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True)
+
+    rc = _run_cli(
+        "specify", tid, "--body", "b", "--author", "claude-triage"
+    )
+
+    assert rc == 0
+    with kb.connect() as conn:
+        comments = kb.list_comments(conn, tid)
+    assert any(c.author == "claude-triage" for c in comments)

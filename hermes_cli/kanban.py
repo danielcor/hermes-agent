@@ -855,7 +855,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "specify",
         help="Flesh out a triage-column task into a concrete spec "
              "(title + body) and promote it to todo. Uses the auxiliary "
-             "LLM configured under auxiliary.triage_specifier.",
+             "LLM configured under auxiliary.triage_specifier, or your "
+             "own text with --title/--body.",
     )
     p_specify.add_argument(
         "task_id",
@@ -884,6 +885,22 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--json",
         action="store_true",
         help="Emit one JSON object per task on stdout",
+    )
+    p_specify.add_argument(
+        "--title",
+        default=None,
+        help="Manual mode: set this exact title and skip the auxiliary "
+             "LLM entirely. Pair with --body.",
+    )
+    p_specify.add_argument(
+        "--body",
+        default=None,
+        help="Manual mode: set this exact body and skip the auxiliary LLM.",
+    )
+    p_specify.add_argument(
+        "--assignee",
+        default=None,
+        help="Assign the task while promoting it (manual mode only)",
     )
 
     # --- decompose --- (triage → fan-out via auxiliary LLM + orchestrator)
@@ -2883,6 +2900,25 @@ def _cmd_specify(args: argparse.Namespace) -> int:
         )
         return 2
 
+    manual_title = getattr(args, "title", None)
+    manual_body = getattr(args, "body", None)
+    manual_assignee = getattr(args, "assignee", None)
+    manual = manual_title is not None or manual_body is not None
+
+    if manual and all_flag:
+        print(
+            "kanban: --title/--body cannot be combined with --all "
+            "(a sweep cannot share one body)",
+            file=sys.stderr,
+        )
+        return 2
+    if manual_assignee is not None and not manual:
+        print(
+            "kanban: --assignee requires --title or --body",
+            file=sys.stderr,
+        )
+        return 2
+
     if all_flag:
         ids = spec.list_triage_ids(tenant=tenant)
         if not ids:
@@ -2908,7 +2944,16 @@ def _cmd_specify(args: argparse.Namespace) -> int:
     ok_count = 0
     fail_count = 0
     for tid in ids:
-        outcome = spec.specify_task(tid, author=author)
+        if manual:
+            outcome = spec.specify_task_manual(
+                tid,
+                title=manual_title,
+                body=manual_body,
+                assignee=manual_assignee,
+                author=author,
+            )
+        else:
+            outcome = spec.specify_task(tid, author=author)
         if outcome.ok:
             ok_count += 1
         else:

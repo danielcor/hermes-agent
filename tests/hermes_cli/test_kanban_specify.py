@@ -332,3 +332,94 @@ def test_cli_specify_author_passed_through(kanban_home, capsys):
     with kb.connect() as conn:
         comments = kb.list_comments(conn, tid)
     assert comments and comments[0].author == "custom-agent"
+
+
+# ---------------------------------------------------------------------------
+# Manual specify — caller supplies the spec, no auxiliary LLM
+# ---------------------------------------------------------------------------
+
+def test_manual_specify_sets_title_body_assignee_and_promotes(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True)
+
+    out = spec.specify_task_manual(
+        tid,
+        title="clean title",
+        body="clean body",
+        assignee="claude-triage",
+    )
+
+    assert out.ok is True
+    assert out.new_title == "clean title"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    # Parent-free → recompute_ready promotes to ready (same as the LLM path).
+    assert task.status == "ready"
+    assert task.title == "clean title"
+    assert task.body == "clean body"
+    assert task.assignee == "claude-triage"
+
+
+def test_manual_specify_never_calls_the_aux_llm(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True)
+
+    with patch("agent.auxiliary_client.call_llm") as call_llm:
+        out = spec.specify_task_manual(tid, body="body only")
+
+    assert out.ok is True
+    call_llm.assert_not_called()
+
+
+def test_manual_specify_body_only_leaves_title_untouched(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="original", triage=True)
+
+    out = spec.specify_task_manual(tid, body="body only")
+
+    assert out.ok is True
+    assert out.new_title is None
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.title == "original"
+    assert task.body == "body only"
+
+
+def test_manual_specify_requires_title_or_body(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True)
+
+    out = spec.specify_task_manual(tid)
+
+    assert out.ok is False
+    assert "needs --title or --body" in out.reason
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "triage"
+
+
+def test_manual_specify_rejects_blank_title(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True)
+
+    out = spec.specify_task_manual(tid, title="   ", body="body")
+
+    assert out.ok is False
+    assert "title cannot be blank" in out.reason
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "triage"
+
+
+def test_manual_specify_unknown_task_id(kanban_home):
+    out = spec.specify_task_manual("t_does_not_exist", body="body")
+    assert out.ok is False
+    assert out.reason == "unknown task id"
+
+
+def test_manual_specify_non_triage_reason_matches_llm_path(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="already todo")
+
+    manual = spec.specify_task_manual(tid, body="body")
+
+    assert manual.ok is False
+    assert "task is not in triage" in manual.reason

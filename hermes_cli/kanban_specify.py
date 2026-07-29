@@ -249,6 +249,61 @@ def specify_task(
     return SpecifyOutcome(task_id, True, "specified", new_title=new_title)
 
 
+def specify_task_manual(
+    task_id: str,
+    *,
+    title: Optional[str] = None,
+    body: Optional[str] = None,
+    assignee: Optional[str] = None,
+    author: Optional[str] = None,
+) -> SpecifyOutcome:
+    """Promote a triage task to ``todo`` using caller-supplied text.
+
+    Same contract as :func:`specify_task` — identical ``SpecifyOutcome``
+    shape, same "expected failures return ok=False rather than raise"
+    tolerance — but the auxiliary LLM is never touched. The caller (a
+    human, or Claude Code driving ``/hermes-triage``) already wrote the
+    spec, so there is nothing to generate.
+
+    ``title=None`` leaves the existing title alone; same for ``body``.
+    At least one of the two must be supplied — a call that changes
+    neither would be a bare status flip, which ``promote`` already does.
+    """
+    if title is None and body is None:
+        return SpecifyOutcome(
+            task_id, False, "manual specify needs --title or --body"
+        )
+    if title is not None and not title.strip():
+        # specify_triage_task raises on a blank title; catch it here so
+        # the caller gets an outcome instead of a traceback.
+        return SpecifyOutcome(task_id, False, "title cannot be blank")
+
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+    if task is None:
+        return SpecifyOutcome(task_id, False, "unknown task id")
+    if task.status != "triage":
+        return SpecifyOutcome(
+            task_id, False, f"task is not in triage (status={task.status!r})"
+        )
+
+    with kb.connect_closing() as conn:
+        ok = kb.specify_triage_task(
+            conn,
+            task_id,
+            title=title,
+            body=body,
+            assignee=assignee,
+            author=author or _profile_author(),
+        )
+    if not ok:
+        # Race: promoted or archived between the read above and this write.
+        return SpecifyOutcome(
+            task_id, False, "task moved out of triage before promotion"
+        )
+    return SpecifyOutcome(task_id, True, "specified", new_title=title)
+
+
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     """Return task ids currently in the triage column.
 

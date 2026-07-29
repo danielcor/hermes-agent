@@ -491,6 +491,12 @@ def test_run_slash_specify_help_is_reachable(kanban_home):
     assert "specify" in out.lower()
     # Help dump should NOT come back wrapped as a usage error.
     assert not out.startswith("⚠")
+    # Manual mode flags must stay advertised in the real, reachable help
+    # surface — a regression that silently drops them from p_specify
+    # would otherwise pass the rest of the suite untouched.
+    assert "--title" in out
+    assert "--body" in out
+    assert "--assignee" in out
 
 
 # ---------------------------------------------------------------------------

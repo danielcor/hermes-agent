@@ -847,7 +847,8 @@ git -C <repo> branch -d wt/<task-id>
 ```
 
 If the push is rejected, stop after the merge: the commit stays local on
-`<base>`, the worktree is already removed, and the comment says the push failed.
+`<base>`, the worktree and branch are still in place because removal comes after the push, and
+the comment says the push failed.
 
 Record the landed SHA: `git -C <repo> rev-parse HEAD`.
 
@@ -902,7 +903,7 @@ hermes kanban --board <slug> comment <task-id> --author claude-triage "<reason>"
 | `openspec validate --strict` unfixable | Worktree and branch intact; validator output in the comment. |
 | 5 Codex rounds still dirty | Worktree and branch intact; open findings in the comment. |
 | `<repo>` dirty at merge time | Worktree and branch intact; merging is the human's call. |
-| `git push origin <base>` rejected | Merge commit local on `<base>`; worktree already removed. |
+| `git push origin <base>` rejected | Merge commit local on `<base>`; worktree and branch still intact. |
 
 Never force-push, never `git checkout -f`, never `worktree remove --force`, and
 never delete a branch that still holds unmerged work.

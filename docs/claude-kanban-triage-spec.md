@@ -197,5 +197,10 @@ human's in-flight work. Detect it up front with `git status --porcelain` and sto
   missing folder, not a wrong one.
 - **Concurrent runs.** Two `/hermes-triage` sessions on the same board would both claim the same
   triage tasks. Out of scope; run one at a time. Different boards are safe — separate DBs.
+- **Promotion starts real work.** A task promoted out of `triage` lands in `todo` and is flipped
+  to `ready` by `recompute_ready`, at which point a live gateway dispatcher spawns a worker on
+  it. Verified in Task 7: the promoted fixture task was picked up immediately and crash-looped
+  until it was manually blocked. Promotion is therefore not a filing action — it starts
+  implementation of whatever the proposal describes.
 - **Non-OpenSpec repos.** Steps 4 and 5 assume the board's repo has an `openspec/` tree. A future
   board without one needs a different proposal layout, unspecified here.

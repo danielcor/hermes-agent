@@ -164,7 +164,7 @@ bad idea never halts the sweep.
 | 5 Codex rounds still dirty | Worktree and branch intact, open findings in the comment |
 | `openspec validate` unfixable | Worktree and branch intact, validator output in the comment |
 | `<repo>` dirty at merge time | Worktree and branch intact; merge is the human's call |
-| `git push origin <base>` rejected | Merge commit local on `<base>`, worktree removed |
+| `git push origin <base>` rejected | Merge commit local on `<base>`; worktree and branch still intact |
 
 Rationale for the dirty-worktree abort: step 8 merges into the `<repo>` working tree. Git
 refuses a merge that would overwrite local modifications, and forcing past that risks the

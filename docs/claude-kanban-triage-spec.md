@@ -127,7 +127,7 @@ Below, `<repo>` is the board's resolved repo root and `<base>` its base branch �
 | 2 | Classify each task: proposal idea, or other (bug / question / chore / junk) |
 | 3 | `git worktree add <repo>/.worktrees/<task-id> -b wt/<task-id> <base>` |
 | 4 | Write `openspec/changes/<slug>/{proposal.md, tasks.md, specs/…}` in that worktree |
-| 5 | `openspec validate <slug> --strict --json` — hard gate, fix until clean |
+| 5 | `openspec validate <slug> --strict --json` — structural gate on `specs/` deltas only, fix until clean |
 | 6 | Commit, scoped to `openspec/changes/<slug>` only |
 | 7 | `codex exec review --commit <sha>` → fix findings → `git commit --amend`. Max 5 rounds |
 | 8 | In `<repo>` on `<base>`: `git pull --rebase origin <base>`, merge `wt/<task-id>`, push `origin <base>`, `git worktree remove`, delete the branch |
@@ -185,9 +185,13 @@ human's in-flight work. Detect it up front with `git status --porcelain` and sto
 - **Codex round ping-pong.** Subjective findings can survive five rounds. The cap converts that
   from a hang into a reported stall, but a chronically stalling proposal type needs its review
   prompt narrowed.
-- **Proposal quality is unmeasured.** `openspec validate --strict` checks structure, and Codex
-  checks reasoning, but neither confirms the proposal solves the idea the human had. The `todo`
-  handoff body is the human's checkpoint.
+- **Proposal quality is unmeasured, and the validator is narrower than it looks.**
+  `openspec validate <name> --strict` calls only `validateChangeDeltaSpecs` — verified in the
+  installed validator at `dist/commands/validate.js:143-149`, where `proposal.md` is never
+  opened. It structurally checks `specs/**/spec.md` deltas and nothing else, so a garbage
+  `proposal.md` passes. Narrative quality rests entirely on Claude at write time and on the
+  Codex loop; neither confirms the proposal solves the idea the human had. The `todo` handoff
+  body is the human's checkpoint.
 - **Board/repo drift.** Nothing enforces the one-board-per-repo convention; a board whose project
   `primary:` folder moves resolves to a stale path. The hard-error-on-unresolvable rule catches a
   missing folder, not a wrong one.

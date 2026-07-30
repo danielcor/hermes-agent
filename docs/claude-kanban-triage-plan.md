@@ -766,16 +766,19 @@ Expected: worktree present on `wt/<task-id>`; one commit touching only
 
 - [ ] **Step 4: Verify the abort path on a validator failure**
 
-Hand-break a proposal to confirm the gate is real:
+Hand-break a proposal to confirm the gate is real. Break the **spec delta**, not `proposal.md`:
+`openspec validate <name> --strict` calls only `validateChangeDeltaSpecs`
+(`dist/commands/validate.js:143-149`) and never opens `proposal.md`, so corrupting the narrative
+passes and proves nothing.
 
 ```bash
 cd /tmp/hermes-triage-fixture/repo/.worktrees/<task-id>
-echo "garbage" > openspec/changes/<change-slug>/proposal.md
+echo "garbage" > openspec/changes/<change-slug>/specs/<capability>/spec.md
 openspec validate <change-slug> --strict
 ```
 
-Expected: non-zero exit with a specific complaint. Restore the file with
-`git checkout -- openspec/changes/<change-slug>/proposal.md`.
+Expected: non-zero exit with a specific complaint about the delta structure. Restore with
+`git checkout -- openspec/changes/<change-slug>/specs/`.
 
 - [ ] **Step 5: Verify the file is in place**
 

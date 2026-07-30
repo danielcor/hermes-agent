@@ -1181,6 +1181,7 @@ _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
     "use",
     "rename",
     "set-default-workdir",
+    "set-auto-triage",
 })
 
 

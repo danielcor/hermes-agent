@@ -491,6 +491,54 @@ def test_delegate_child_kanban_cli_cannot_delete_parent_board(
     assert kb.board_dir("victim").is_dir()
 
 
+def test_delegate_child_kanban_cli_cannot_set_auto_triage_on_parent_board(
+    monkeypatch,
+    tmp_path,
+):
+    """`boards set-auto-triage` is a board mutator (Task 9) and must be denied
+    to a delegated child the same way `set-default-workdir` / `rm` / etc are —
+    a clean rc=1 message, not an uncaught PermissionError traceback from
+    write_board_metadata's deeper _assert_not_delegated_child_mutation()."""
+    kb, _tid, _workspace, _attachments_root = _make_running_kanban_task(
+        monkeypatch,
+        tmp_path,
+    )
+    kb.create_board("victim2")
+    assert kb.read_board_metadata("victim2")["auto_triage"] is True
+
+    from agent.delegation_context import delegated_child_context
+    from tools.environments.local import LocalEnvironment
+
+    code = (
+        "from hermes_cli import kanban; "
+        "import argparse; "
+        "p=argparse.ArgumentParser(); "
+        "sub=p.add_subparsers(dest='cmd'); "
+        "kanban.build_parser(sub); "
+        "args=p.parse_args(['kanban','boards','set-auto-triage','victim2','off']); "
+        "raise SystemExit(kanban.kanban_command(args))"
+    )
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+    try:
+        with delegated_child_context():
+            result = env.execute(
+                _python_with_repo_path(code),
+                timeout=15,
+            )
+    finally:
+        env.cleanup()
+
+    assert result["returncode"] == 1
+    # Must take the clean argparse-dispatch guard path (_is_delegated_child_cli_mutation
+    # in kanban.py), not fall through to the deeper write_board_metadata() ->
+    # _assert_not_delegated_child_mutation() PermissionError, which is a real trust
+    # boundary but produces an uncaught traceback instead of a fast-fail message.
+    assert "kanban: delegate_task child contexts cannot mutate Kanban tasks via the CLI" in result["output"]
+    assert "Traceback" not in result["output"]
+    assert "PermissionError" not in result["output"]
+    assert kb.read_board_metadata("victim2")["auto_triage"] is True
+
+
 def test_delegate_child_kanban_mutator_guard_rejects_explicit_task_id(monkeypatch):
     """Defense in depth: direct handler access still cannot mutate a board."""
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent")

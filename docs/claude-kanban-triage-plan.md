@@ -1006,3 +1006,251 @@ hermes kanban specify --help | grep -E "^\s+--(title|body|assignee)"
 ```
 
 Expected: all three flags. If absent, the install did not pick up the branch — report that rather than editing `~/.hermes/hermes-agent` directly.
+
+---
+
+### Task 9: Per-board auto-triage opt-out
+
+Added mid-execution. Task 5 discovered that the gateway's dispatcher auto-decomposes triage
+tasks on **every** board within ~85 seconds, racing `/hermes-triage` and winning. Nothing today
+can exempt a board: `_auto_decompose_tick` sweeps `list_boards()` unconditionally, gated only by
+the global `kanban.auto_decompose`, and `list_triage_ids` applies no assignee filter. Without
+this task the skill cannot own a triage column.
+
+**Files:**
+- Modify: `hermes_cli/kanban_db.py:660-687` (`read_board_metadata` defaults) and
+  `hermes_cli/kanban_db.py:691-717` (`write_board_metadata` kwargs)
+- Modify: `gateway/kanban_watchers.py:1337-1380` (`_auto_decompose_tick` per-board loop)
+- Modify: `hermes_cli/kanban.py` (`boards` subparser near `:322-328`, dispatch near `:1198-1223`,
+  new handler near `:1378`)
+- Test: `tests/hermes_cli/test_kanban_boards.py` (append)
+
+**Interfaces:**
+- Consumes: `read_board_metadata(slug) -> dict`, `write_board_metadata(board, *, name=None,
+  description=None, icon=None, color=None, archived=None, default_workdir=None) -> None`,
+  `list_boards(include_archived=False) -> list[dict]`.
+- Produces: board metadata key `auto_triage` (bool, default `True`); CLI
+  `hermes kanban boards set-auto-triage <slug> <on|off>`. Task 5's fix round and Task 7 both
+  read this flag.
+
+**Design constraints:**
+- Default `True` — existing boards keep behaving exactly as they do now. This is opt-out, not
+  opt-in. A board.json written before this task has no `auto_triage` key; `read_board_metadata`
+  starts from a hardcoded default dict and then does `meta.update(raw)`, so the key materializes
+  as `True` on next read with no migration. Do not add a schema version.
+- Follow the `archived` template exactly: `"auto_triage": True` in the read-side default dict,
+  `auto_triage: Optional[bool] = None` kwarg on the writer, and
+  `if auto_triage is not None: meta["auto_triage"] = bool(auto_triage)` so an unmentioned key is
+  preserved.
+- The skip belongs in the dispatcher's per-board loop, not in `list_triage_ids`. `list_triage_ids`
+  is also called by the manual `hermes kanban decompose` path, and a human running that command
+  explicitly must still work on an opted-out board.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `tests/hermes_cli/test_kanban_boards.py`. Read the top of that file first and reuse
+its existing fixture rather than declaring a new one:
+
+```python
+def test_auto_triage_defaults_true_for_a_new_board(kanban_home):
+    kb.create_board("optout-default", name="Optout Default")
+    meta = kb.read_board_metadata("optout-default")
+    assert meta["auto_triage"] is True
+
+
+def test_auto_triage_materializes_true_for_a_legacy_board_json(kanban_home):
+    kb.create_board("legacy", name="Legacy")
+    path = kb.board_metadata_path("legacy")
+    raw = jsonlib.loads(path.read_text())
+    del raw["auto_triage"]
+    path.write_text(jsonlib.dumps(raw))
+
+    meta = kb.read_board_metadata("legacy")
+    assert meta["auto_triage"] is True
+
+
+def test_write_board_metadata_sets_and_preserves_auto_triage(kanban_home):
+    kb.create_board("optout", name="Optout", description="keep me")
+
+    kb.write_board_metadata("optout", auto_triage=False)
+    assert kb.read_board_metadata("optout")["auto_triage"] is False
+    assert kb.read_board_metadata("optout")["description"] == "keep me"
+
+    kb.write_board_metadata("optout", description="changed")
+    assert kb.read_board_metadata("optout")["auto_triage"] is False
+    assert kb.read_board_metadata("optout")["description"] == "changed"
+
+    kb.write_board_metadata("optout", auto_triage=True)
+    assert kb.read_board_metadata("optout")["auto_triage"] is True
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+```bash
+cd /opt/dev/danielcor/hermes-kanban-specify && python -m pytest tests/hermes_cli/test_kanban_boards.py -k auto_triage -v
+```
+
+Expected: 3 failures — `KeyError: 'auto_triage'`, and
+`TypeError: write_board_metadata() got an unexpected keyword argument 'auto_triage'`.
+
+- [ ] **Step 3: Add the metadata key**
+
+In `hermes_cli/kanban_db.py`, add to `read_board_metadata`'s default dict, after `"archived": False,`:
+
+```python
+        "auto_triage": True,
+```
+
+In `write_board_metadata`, add the kwarg alongside `archived`:
+
+```python
+    auto_triage: Optional[bool] = None,
+```
+
+and in the merge body, next to the `archived` branch:
+
+```python
+    if auto_triage is not None:
+        meta["auto_triage"] = bool(auto_triage)
+```
+
+Update the writer's docstring to name the new key.
+
+- [ ] **Step 4: Run the metadata tests to verify they pass**
+
+```bash
+cd /opt/dev/danielcor/hermes-kanban-specify && python -m pytest tests/hermes_cli/test_kanban_boards.py -v
+```
+
+Expected: all pass, including the pre-existing board tests.
+
+- [ ] **Step 5: Write the failing dispatcher test**
+
+The dispatcher skip needs its own test. Find the existing test module covering
+`_auto_decompose_tick` — search with
+`grep -rln "auto_decompose" tests/` — and append there, matching that module's existing
+mocking style. If no test module covers it, create
+`tests/gateway/test_kanban_auto_decompose_optout.py` and mirror the closest existing gateway
+test's fixtures.
+
+The test must assert the behavioral contract, not the implementation: with two boards, one
+`auto_triage=True` and one `auto_triage=False`, each holding a triage task, a single
+`_auto_decompose_tick` call invokes `decompose_task` for the enabled board's task and never for
+the disabled board's task. Patch `kanban_decompose.decompose_task` with a mock and assert on the
+task ids it received.
+
+- [ ] **Step 6: Run it to verify it fails**
+
+Expected: the mock is called for both task ids — the opted-out board is not yet skipped.
+
+- [ ] **Step 7: Implement the dispatcher skip**
+
+In `gateway/kanban_watchers.py`, inside `_auto_decompose_tick`'s loop over
+`_kb.list_boards(include_archived=False)`, skip a board whose metadata opts out — before it calls
+`_decomp.list_triage_ids()` for that board, so an opted-out board costs no query:
+
+```python
+                if not _kb.read_board_metadata(_slug).get("auto_triage", True):
+                    continue
+```
+
+Use whatever the loop's actual board-slug variable is named — read the loop before editing. The
+`.get(..., True)` default matters: a board.json that predates Task 9 must behave as before.
+
+- [ ] **Step 8: Run the dispatcher test to verify it passes**
+
+Run the module you added the test to. Expected: pass.
+
+- [ ] **Step 9: Add the CLI setter**
+
+In `hermes_cli/kanban.py`, add a subparser modeled on `boards set-default-workdir`
+(argparse near `:322-328`, handler near `:1378`):
+
+```python
+    p_bat = boards_sub.add_parser(
+        "set-auto-triage",
+        help="Turn the dispatcher's automatic triage specify/decompose on or "
+             "off for one board. Off leaves that board's triage column to an "
+             "external owner.",
+    )
+    p_bat.add_argument("slug")
+    p_bat.add_argument("state", choices=["on", "off"])
+```
+
+Use the actual subparser variable name from the surrounding `boards` block — read it first.
+
+Handler, next to `_cmd_boards_set_default_workdir`:
+
+```python
+def _cmd_boards_set_auto_triage(args: argparse.Namespace) -> int:
+    """Toggle the dispatcher's auto-triage sweep for one board."""
+    normed = kb.normalize_board_slug(args.slug)
+    enabled = args.state == "on"
+    kb.write_board_metadata(normed, auto_triage=enabled)
+    state = "on" if enabled else "off"
+    print(f"Board {normed}: auto-triage {state}")
+    return 0
+```
+
+Use the same slug-normalizing helper `_cmd_boards_set_default_workdir` uses — read that handler
+and copy its approach rather than assuming `normalize_board_slug` exists under that name. Wire
+the new subcommand into `_dispatch_boards` alongside the others.
+
+Also surface the flag in `boards show` output so the state is discoverable — add a line next to
+where that handler prints the default workdir.
+
+- [ ] **Step 10: Write and run the CLI test**
+
+Append to `tests/hermes_cli/test_kanban_boards.py`, using that file's existing CLI-invocation
+helper if it has one (check for a `_run_cli`-style function; `tests/hermes_cli/test_kanban_specify.py:218`
+has one to copy the shape from):
+
+```python
+def test_cli_set_auto_triage_off_then_on(kanban_home, capsys):
+    kb.create_board("cliopt", name="Cli Opt")
+
+    rc = _run_cli("boards", "set-auto-triage", "cliopt", "off")
+    assert rc == 0
+    assert kb.read_board_metadata("cliopt")["auto_triage"] is False
+
+    rc = _run_cli("boards", "set-auto-triage", "cliopt", "on")
+    assert rc == 0
+    assert kb.read_board_metadata("cliopt")["auto_triage"] is True
+
+
+def test_cli_set_auto_triage_rejects_bad_state(kanban_home):
+    kb.create_board("cliopt2", name="Cli Opt 2")
+    with pytest.raises(SystemExit):
+        _run_cli("boards", "set-auto-triage", "cliopt2", "maybe")
+```
+
+Run: `python -m pytest tests/hermes_cli/test_kanban_boards.py -v`. Expected: all pass.
+
+- [ ] **Step 11: Verify against the live pmzbot board**
+
+```bash
+cd /opt/dev/danielcor/hermes-kanban-specify
+python -c "
+import sys; sys.path.insert(0, '.')
+from hermes_cli import kanban_db as kb
+print(kb.read_board_metadata('pmzbot').get('auto_triage'))
+"
+```
+
+Expected: `True` — the real board, whose `board.json` predates this task, reads as opted in. Do
+not change it here; Task 7 turns it off for the boards the skill owns.
+
+- [ ] **Step 12: Commit**
+
+```bash
+cd /opt/dev/danielcor/hermes-kanban-specify
+git add hermes_cli/kanban_db.py hermes_cli/kanban.py gateway/kanban_watchers.py tests/
+git commit -m "feat(kanban): per-board auto-triage opt-out
+
+The gateway dispatcher auto-decomposed triage tasks on every board, so an
+external owner of a triage column always lost the race. Boards now carry
+an auto_triage flag, default on, and the dispatcher skips a board that
+turns it off. The manual decompose command still works there.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+```

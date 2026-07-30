@@ -808,7 +808,7 @@ Append to the `## Proposal lane` section of `~/.claude/skills/hermes-triage/SKIL
 
 ```bash
 cd <repo>/.worktrees/<task-id>
-codex exec review --commit <sha>
+codex exec review "Review commit <sha> as a design document — problem clarity, approach coherence, missing cases, unstated assumptions, spec-delta/narrative consistency. Do not raise style, formatting, or wording findings."
 ```
 
 For each round:

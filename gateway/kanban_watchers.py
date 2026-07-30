@@ -1159,7 +1159,7 @@ class GatewayKanbanWatchersMixin:
                 # spending a list_triage_ids() query on it. The manual
                 # `hermes kanban decompose` path is unaffected; only this
                 # dispatcher sweep honours the flag.
-                if not _kb.read_board_metadata(slug).get("auto_triage", True):
+                if not b.get("auto_triage", True):
                     continue
                 # Pin this board for the duration of the call — same
                 # pattern as the dashboard specify endpoint. The

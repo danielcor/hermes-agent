@@ -594,6 +594,13 @@ def test_write_board_metadata_sets_and_preserves_auto_triage(fresh_home):
     kb.write_board_metadata("optout", auto_triage=True)
     assert kb.read_board_metadata("optout")["auto_triage"] is True
 
+    # A neighbouring write that doesn't mention auto_triage must preserve
+    # True too — bool(None) == False would make this indistinguishable from
+    # a missing `if auto_triage is not None:` guard if only the False case
+    # were checked above.
+    kb.write_board_metadata("optout", description="again")
+    assert kb.read_board_metadata("optout")["auto_triage"] is True
+
 
 def test_cli_set_auto_triage_off_then_on(tmp_path):
     env = {"HERMES_HOME": str(tmp_path)}
@@ -622,3 +629,7 @@ def test_cli_set_auto_triage_rejects_bad_state(tmp_path):
     assert _cli(["boards", "create", "cliopt2"], env_extra=env).returncode == 0
     r = _cli(["boards", "set-auto-triage", "cliopt2", "maybe"], env_extra=env)
     assert r.returncode == 2
+    # returncode == 2 alone is also what argparse returns for an unknown
+    # *subcommand* — assert the specific choices-validation message so this
+    # doesn't pass for the wrong reason (e.g. if the subcommand were dropped).
+    assert "invalid choice: 'maybe'" in r.stderr

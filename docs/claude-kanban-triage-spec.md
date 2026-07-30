@@ -129,7 +129,7 @@ Below, `<repo>` is the board's resolved repo root and `<base>` its base branch �
 | 4 | Write `openspec/changes/<slug>/{proposal.md, tasks.md, specs/…}` in that worktree |
 | 5 | `openspec validate <slug> --strict --json` — structural gate on `specs/` deltas only, fix until clean |
 | 6 | Commit, scoped to `openspec/changes/<slug>` only |
-| 7 | `codex exec review --commit <sha>` → fix findings → `git commit --amend`. Max 5 rounds |
+| 7 | `codex exec review "<design-review prompt naming <sha>>"` → fix findings → `git commit --amend`. Max 5 rounds |
 | 8 | In `<repo>` on `<base>`: `git pull --rebase origin <base>`, merge `wt/<task-id>`, push `origin <base>`, `git worktree remove`, delete the branch |
 | 9 | `hermes kanban specify <task-id> --title <refined> --body <spec> --assignee claude-triage` |
 
@@ -140,6 +140,22 @@ worktree and no Codex round.
 suffix: exact correspondence to the board beats readability, and the proposal directory carries
 the readable slug anyway. Task ids are unique within a board, and each board maps to a distinct
 repo, so `wt/<task-id>` cannot collide across boards.
+
+#### Codex invocation form
+
+`--commit`, `--base`, and `--uncommitted` each declare `conflicts_with_all` against the others
+*and* against the positional prompt (`codex-rs/exec/src/cli.rs:266-297`), so a custom review
+prompt cannot be combined with `--commit`. The skill therefore uses the prompt-only form and
+names the SHA inside the prompt. That loses nothing: `ReviewTarget::Custom` passes the prompt
+through verbatim (`codex-rs/prompts/src/review_request.rs:91-97`), and Codex's own `--commit`
+template is itself just prose naming the SHA with no diff embedded (`review_request.rs:32`).
+There is no implicit default target — with no flag and no prompt, Codex hard-errors
+(`codex-rs/exec/src/lib.rs:1990-2018`).
+
+The prompt scopes Codex to reviewing a design document — problem clarity, approach coherence,
+missing cases, unstated assumptions, spec-delta/narrative consistency — and excludes style and
+prose-polish findings. Unscoped, Codex reviewed the proposal as if it were code and failed to
+converge within the 5-round cap.
 
 #### Step 9 body contents
 

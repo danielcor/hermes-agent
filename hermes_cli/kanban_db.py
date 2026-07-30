@@ -675,6 +675,7 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "default_workdir": None,
         "created_at": None,
         "archived": False,
+        "auto_triage": True,
     }
     try:
         p = board_metadata_path(slug)
@@ -700,11 +701,17 @@ def write_board_metadata(
     color: Optional[str] = None,
     archived: Optional[bool] = None,
     default_workdir: Optional[str] = None,
+    auto_triage: Optional[bool] = None,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
 
     Preserves any existing fields not mentioned in the call. Sets
-    ``created_at`` on first write. Returns the resulting metadata dict.
+    ``created_at`` on first write. ``auto_triage`` (default ``True``)
+    gates the gateway dispatcher's automatic triage specify/decompose
+    sweep for this board; setting it ``False`` leaves the board's
+    triage column to an external owner (e.g. a human-invoked skill)
+    without touching the manual ``hermes kanban decompose`` path.
+    Returns the resulting metadata dict.
     """
     _assert_not_delegated_child_mutation()
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
@@ -722,6 +729,8 @@ def write_board_metadata(
         meta["color"] = str(color)
     if archived is not None:
         meta["archived"] = bool(archived)
+    if auto_triage is not None:
+        meta["auto_triage"] = bool(auto_triage)
     if default_workdir is not None:
         meta["default_workdir"] = str(default_workdir) if default_workdir else None
     if not meta.get("created_at"):

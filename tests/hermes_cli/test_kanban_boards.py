@@ -557,3 +557,68 @@ class TestCLI:
         res = _cli(["boards", "list", "--json"], env_extra=env)
         slugs = [b["slug"] for b in json.loads(res.stdout)]
         assert "rmme" not in slugs
+
+
+# ---------------------------------------------------------------------------
+# auto_triage opt-out (Task 9)
+# ---------------------------------------------------------------------------
+
+def test_auto_triage_defaults_true_for_a_new_board(fresh_home):
+    kb.create_board("optout-default", name="Optout Default")
+    meta = kb.read_board_metadata("optout-default")
+    assert meta["auto_triage"] is True
+
+
+def test_auto_triage_materializes_true_for_a_legacy_board_json(fresh_home):
+    kb.create_board("legacy", name="Legacy")
+    path = kb.board_metadata_path("legacy")
+    raw = json.loads(path.read_text())
+    del raw["auto_triage"]
+    path.write_text(json.dumps(raw))
+
+    meta = kb.read_board_metadata("legacy")
+    assert meta["auto_triage"] is True
+
+
+def test_write_board_metadata_sets_and_preserves_auto_triage(fresh_home):
+    kb.create_board("optout", name="Optout", description="keep me")
+
+    kb.write_board_metadata("optout", auto_triage=False)
+    assert kb.read_board_metadata("optout")["auto_triage"] is False
+    assert kb.read_board_metadata("optout")["description"] == "keep me"
+
+    kb.write_board_metadata("optout", description="changed")
+    assert kb.read_board_metadata("optout")["auto_triage"] is False
+    assert kb.read_board_metadata("optout")["description"] == "changed"
+
+    kb.write_board_metadata("optout", auto_triage=True)
+    assert kb.read_board_metadata("optout")["auto_triage"] is True
+
+
+def test_cli_set_auto_triage_off_then_on(tmp_path):
+    env = {"HERMES_HOME": str(tmp_path)}
+    assert _cli(["boards", "create", "cliopt"], env_extra=env).returncode == 0
+
+    r1 = _cli(["boards", "set-auto-triage", "cliopt", "off"], env_extra=env)
+    assert r1.returncode == 0, r1.stderr
+    assert _cli(["boards", "switch", "cliopt"], env_extra=env).returncode == 0
+    r2 = _cli(["boards", "show"], env_extra=env)
+    assert r2.returncode == 0, r2.stderr
+    assert "auto-triage" in r2.stdout.lower()
+
+    home = tmp_path
+    board_json = home / "kanban" / "boards" / "cliopt" / "board.json"
+    data = json.loads(board_json.read_text())
+    assert data["auto_triage"] is False
+
+    r3 = _cli(["boards", "set-auto-triage", "cliopt", "on"], env_extra=env)
+    assert r3.returncode == 0, r3.stderr
+    data = json.loads(board_json.read_text())
+    assert data["auto_triage"] is True
+
+
+def test_cli_set_auto_triage_rejects_bad_state(tmp_path):
+    env = {"HERMES_HOME": str(tmp_path)}
+    assert _cli(["boards", "create", "cliopt2"], env_extra=env).returncode == 0
+    r = _cli(["boards", "set-auto-triage", "cliopt2", "maybe"], env_extra=env)
+    assert r.returncode == 2

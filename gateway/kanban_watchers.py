@@ -1356,6 +1356,14 @@ class GatewayKanbanWatchersMixin:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 if attempted >= auto_decompose_per_tick:
                     break
+                # Per-board opt-out (#kanban-triage-task9): a board whose
+                # metadata turns off auto_triage is left to an external
+                # owner (e.g. a human-invoked triage skill) — skip before
+                # spending a list_triage_ids() query on it. The manual
+                # `hermes kanban decompose` path is unaffected; only this
+                # dispatcher sweep honours the flag.
+                if not _kb.read_board_metadata(slug).get("auto_triage", True):
+                    continue
                 # Pin this board for the duration of the call — same
                 # pattern as the dashboard specify endpoint. The
                 # decomposer module connects with no board kwarg and

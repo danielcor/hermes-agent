@@ -5549,24 +5549,59 @@ def decompose_triage_task(
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Archive a task only when no worker run is active.
+
+    Invariant: archive never terminates or reclaims a live worker. It succeeds
+    only when ``current_run_id`` is NULL and no ``task_runs`` row is unended.
+    Callers must first complete, block, or explicitly reclaim the run through
+    its dedicated lifecycle path. This avoids an archived task with a silently
+    abandoned worker and incomplete terminal task fields.
+    """
     with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if not row or row["status"] == "archived":
+            return False
+        live_run = conn.execute(
+            "SELECT 1 FROM task_runs WHERE task_id = ? AND ended_at IS NULL LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if row["current_run_id"] is not None or live_run is not None:
+            raise RuntimeError(
+                "cannot archive task with an active run; complete, block, or reclaim it first"
+            )
+        # Keep the active-run condition in the CAS update as a second line of
+        # defense against an interleaving claim between the read and write.
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status != 'archived'",
+            "WHERE id = ? AND status != 'archived' AND current_run_id IS NULL",
             (task_id,),
         )
         if cur.rowcount != 1:
+            # ``BEGIN IMMEDIATE`` prevents another lifecycle writer from
+            # interleaving here, but retain the stable conflict contract if a
+            # future caller changes those transaction boundaries.
+            active = conn.execute(
+                """
+                SELECT 1
+                  FROM tasks
+                 WHERE id = ? AND current_run_id IS NOT NULL
+                UNION ALL
+                SELECT 1
+                  FROM task_runs
+                 WHERE task_id = ? AND ended_at IS NULL
+                 LIMIT 1
+                """,
+                (task_id, task_id),
+            ).fetchone()
+            if active is not None:
+                raise RuntimeError(
+                    "cannot archive task with an active run; complete, block, or reclaim it first"
+                )
             return False
-        # If archive happened while a run was still in flight (e.g. user
-        # archived a running task from the dashboard), close that run with
-        # outcome='reclaimed' so attempt history isn't orphaned.
-        run_id = _end_run(
-            conn, task_id,
-            outcome="reclaimed", status="reclaimed",
-            summary="task archived with run still active",
-        )
-        _append_event(conn, task_id, "archived", None, run_id=run_id)
+        _append_event(conn, task_id, "archived", None)
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.

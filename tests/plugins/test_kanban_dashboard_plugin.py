@@ -1461,8 +1461,8 @@ def test_patch_status_done_without_summary_still_works(client):
         conn.close()
 
 
-def test_patch_status_archive_closes_running_run(client):
-    """PATCH to archived while running must close the in-flight run."""
+def test_patch_status_archive_rejects_running_run(client):
+    """PATCH archive reports a conflict and leaves the live run untouched."""
     r = client.post("/api/plugins/kanban/tasks", json={"title": "z", "assignee": "worker"})
     tid = r.json()["task"]["id"]
     from hermes_cli import kanban_db as kb
@@ -1470,6 +1470,7 @@ def test_patch_status_archive_closes_running_run(client):
     try:
         kb.claim_task(conn, tid)
         open_run = kb.latest_run(conn, tid)
+        assert open_run is not None
         assert open_run.ended_at is None
     finally:
         conn.close()
@@ -1477,13 +1478,56 @@ def test_patch_status_archive_closes_running_run(client):
         f"/api/plugins/kanban/tasks/{tid}",
         json={"status": "archived"},
     )
-    assert r.status_code == 200, r.text
+    assert r.status_code == 409, r.text
+    assert "cannot archive task with an active run" in r.json()["detail"]
     conn = kb.connect()
     try:
         task = kb.get_task(conn, tid)
-        assert task.status == "archived"
-        assert task.current_run_id is None
-        assert kb.latest_run(conn, tid).outcome == "reclaimed"
+        assert task is not None
+        assert task.status == "running"
+        assert task.current_run_id == open_run.id
+        latest = kb.latest_run(conn, tid)
+        assert latest is not None
+        assert latest.ended_at is None
+    finally:
+        conn.close()
+
+
+def test_bulk_archive_reports_active_run_conflict_and_archives_idle_sibling(client):
+    active = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "active", "assignee": "worker"},
+    ).json()["task"]["id"]
+    idle = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "idle", "assignee": "worker"},
+    ).json()["task"]["id"]
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.claim_task(conn, active) is not None
+    finally:
+        conn.close()
+
+    response = client.post(
+        "/api/plugins/kanban/tasks/bulk", json={"ids": [active, idle], "archive": True},
+    )
+
+    assert response.status_code == 200, response.text
+    results = {entry["id"]: entry for entry in response.json()["results"]}
+    assert results[active] == {
+        "id": active,
+        "ok": False,
+        "error": "cannot archive task with an active run; complete, block, or reclaim it first",
+    }
+    assert results[idle] == {"id": idle, "ok": True}
+    conn = kb.connect()
+    try:
+        active_task = kb.get_task(conn, active)
+        idle_task = kb.get_task(conn, idle)
+        assert active_task is not None
+        assert idle_task is not None
+        assert active_task.status == "running"
+        assert active_task.current_run_id is not None
+        assert idle_task.status == "archived"
     finally:
         conn.close()
 

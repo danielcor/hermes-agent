@@ -772,6 +772,30 @@ def test_cli_archive_bulk(kanban_home):
         conn.close()
 
 
+def test_cli_archive_refuses_task_with_active_run(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="live", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+    finally:
+        conn.close()
+
+    out = run_slash(f"archive {tid}")
+
+    assert "cannot archive task with an active run" in out
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "running"
+        assert task.current_run_id is not None
+        latest = kb.latest_run(conn, tid)
+        assert latest is not None
+        assert latest.ended_at is None
+    finally:
+        conn.close()
+
+
 def test_cli_archive_rm_deletes_archived_tasks(kanban_home):
     conn = kb.connect()
     try:
@@ -1943,9 +1967,8 @@ def test_cli_complete_bad_metadata_exits_nonzero(kanban_home):
 # Integration hardening (Apr 2026 audit fixes)
 # -------------------------------------------------------------------------
 
-def test_archive_of_running_task_closes_run(kanban_home):
-    """Archiving a claimed task must close the in-flight run with
-    outcome='reclaimed', not orphan it."""
+def test_archive_of_running_task_is_rejected(kanban_home):
+    """Archiving cannot silently reclaim a live worker run."""
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="x", assignee="worker")
@@ -1954,15 +1977,17 @@ def test_archive_of_running_task_closes_run(kanban_home):
         assert run.ended_at is None
         open_run_id = run.id
 
-        assert kb.archive_task(conn, tid) is True
+        with pytest.raises(RuntimeError, match="cannot archive task with an active run"):
+            kb.archive_task(conn, tid)
 
         task = kb.get_task(conn, tid)
-        assert task.status == "archived"
-        assert task.current_run_id is None
-        # The previously-active run must now be closed.
-        closed = kb.get_run(conn, open_run_id)
-        assert closed.ended_at is not None
-        assert closed.outcome == "reclaimed"
+        assert task is not None
+        assert task.status == "running"
+        assert task.current_run_id == open_run_id
+        live = kb.get_run(conn, open_run_id)
+        assert live is not None
+        assert live.ended_at is None
+        assert live.outcome is None
     finally:
         conn.close()
 

@@ -2282,7 +2282,13 @@ def _cmd_archive(args: argparse.Namespace) -> int:
                     print(f"Deleted {tid}")
             return 0 if not failed else 1
         for tid in ids:
-            if not kb.archive_task(conn, tid):
+            try:
+                ok = kb.archive_task(conn, tid)
+            except RuntimeError as e:
+                failed.append(tid)
+                print(f"cannot archive {tid}: {e}", file=sys.stderr)
+                continue
+            if not ok:
                 failed.append(tid)
                 print(f"cannot archive {tid}", file=sys.stderr)
             else:

@@ -197,7 +197,10 @@ def random_op(rng, conn, kb, task_pool):
         ok = kb.unblock_task(conn, tid)
         return {"op": "unblock", "tid": tid, "ok": ok}
     if op == "archive":
-        ok = kb.archive_task(conn, tid)
+        try:
+            ok = kb.archive_task(conn, tid)
+        except RuntimeError:
+            ok = False
         if ok:
             task_pool.remove(tid)
         return {"op": "archive", "tid": tid, "ok": ok}

@@ -1499,6 +1499,110 @@ def test_archive_hides_from_default_list(kanban_home):
         assert len(kb.list_tasks(conn, include_archived=True)) == 1
 
 
+def test_archive_refuses_active_run_without_mutation(kanban_home):
+    """Archive must not abandon a live worker or mutate its task history."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="live", assignee="worker")
+        assert kb.claim_task(conn, tid, claimer="worker:1") is not None
+        kb.add_comment(conn, tid, "worker", "still working")
+        before_task = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone())
+        before_runs = [dict(row) for row in conn.execute(
+            "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (tid,)
+        )]
+        before_events = [dict(row) for row in conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (tid,)
+        )]
+        before_comments = [dict(row) for row in conn.execute(
+            "SELECT * FROM task_comments WHERE task_id = ? ORDER BY id", (tid,)
+        )]
+
+        with pytest.raises(RuntimeError, match="cannot archive task with an active run"):
+            kb.archive_task(conn, tid)
+
+        assert dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()) == before_task
+        assert [dict(row) for row in conn.execute(
+            "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (tid,)
+        )] == before_runs
+        assert [dict(row) for row in conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (tid,)
+        )] == before_events
+        assert [dict(row) for row in conn.execute(
+            "SELECT * FROM task_comments WHERE task_id = ? ORDER BY id", (tid,)
+        )] == before_comments
+
+
+def test_archive_refuses_unpointed_active_run_without_mutation(kanban_home):
+    """Archive refuses a live run even if a damaged task pointer cannot name it."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="unpointed live run", assignee="worker")
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, started_at) VALUES (?, 'running', 1)",
+            (tid,),
+        )
+        before_task = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone())
+        before_runs = [dict(row) for row in conn.execute(
+            "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (tid,)
+        )]
+        before_events = [dict(row) for row in conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (tid,)
+        )]
+
+        with pytest.raises(RuntimeError, match="cannot archive task with an active run"):
+            kb.archive_task(conn, tid)
+
+        assert dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()) == before_task
+        assert [dict(row) for row in conn.execute(
+            "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (tid,)
+        )] == before_runs
+        assert [dict(row) for row in conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (tid,)
+        )] == before_events
+
+
+def test_archive_blocked_capability_task_preserves_history_without_active_run(kanban_home):
+    """A no-run capability hold retains diagnostic history when archived."""
+    reason = "missing required credential"
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="held", assignee="worker")
+        claimed = kb.claim_task(conn, tid, claimer="worker:1")
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.block_task(conn, tid, reason=reason, kind="capability",
+                             expected_run_id=claimed.current_run_id)
+        kb.add_comment(conn, tid, "worker", "credential request recorded")
+        before_task = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone())
+        before_runs = [dict(row) for row in conn.execute(
+            "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (tid,)
+        )]
+        before_events = [dict(row) for row in conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (tid,)
+        )]
+        before_comments = [dict(row) for row in conn.execute(
+            "SELECT * FROM task_comments WHERE task_id = ? ORDER BY id", (tid,)
+        )]
+        assert before_task["current_run_id"] is None
+
+        assert kb.archive_task(conn, tid) is True
+
+        after_task = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone())
+        assert after_task["status"] == "archived"
+        for field in ("block_kind", "block_recurrences", "result", "completed_at", "title", "body", "assignee"):
+            assert after_task[field] == before_task[field]
+        assert after_task["block_kind"] == "capability"
+        assert after_task["result"] is after_task["completed_at"] is None
+        assert [dict(row) for row in conn.execute(
+            "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (tid,)
+        )] == before_runs
+        assert [dict(row) for row in conn.execute(
+            "SELECT * FROM task_comments WHERE task_id = ? ORDER BY id", (tid,)
+        )] == before_comments
+        after_events = [dict(row) for row in conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (tid,)
+        )]
+        assert after_events[:-1] == before_events
+        assert after_events[-1]["kind"] == "archived"
+        assert after_events[-1]["run_id"] is None
+
+
 def test_delete_archived_task_removes_related_rows(kanban_home):
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent")
